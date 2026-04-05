@@ -1,5 +1,6 @@
 /.xmake/
 /.xmake-global/
+/.install-test/
 /build/
 /downloads/
 /config/*.local.json

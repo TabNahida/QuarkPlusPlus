@@ -1,8 +1,10 @@
+[English](README.en.md)
+
 # QuarkPlusPlus
 
 `QuarkPlusPlus` 是一个基于 `xmake` 和 `C++23` 的夸克网盘第三方 CLI 客户端。
 
-当前实现使用 `libcurl + OpenSSL + nlohmann_json`，不再依赖 `WinHTTP / BCrypt / Crypt32` 这类 Windows 专属库。只要 `xmake` 能拉到对应包，代码本身就是按跨平台方向组织的。
+当前实现使用 `libcurl + OpenSSL + nlohmann_json`，不依赖 `WinHTTP / BCrypt / Crypt32` 这类 Windows 专属库。项目默认文档为中文，英文文档见上方链接。
 
 ## 已实现能力
 
@@ -25,15 +27,9 @@
 
 ## 配置
 
-项目默认从 `config/quarkpp.local.json` 读取本地配置，这个文件已经被 `.gitignore` 忽略，不会进入仓库。
+项目默认从 `config/quarkpp.local.json` 读取本地配置。这个文件已被 `.gitignore` 忽略，不会进入仓库。
 
-先复制示例：
-
-```powershell
-Copy-Item config\quarkpp.example.json config\quarkpp.local.json
-```
-
-然后把你的 cookie 填进去：
+建议直接根据 [config/quarkpp.example.json](config/quarkpp.example.json) 新建本地配置文件，并填入你的 cookie：
 
 ```json
 {
@@ -52,73 +48,42 @@ Copy-Item config\quarkpp.example.json config\quarkpp.local.json
 
 ## 构建
 
-```powershell
-$env:XMAKE_GLOBALDIR=(Join-Path (Get-Location) '.xmake-global')
-xmake f -y -m release
-xmake build -y
+```sh
+xmake f -m release
+xmake
 ```
 
-Windows 下可执行文件默认位于：
+## 运行
 
-```text
-build/windows/x64/release/quarkpp.exe
+推荐直接使用 `xmake run`，命令写法跨平台一致：
+
+```sh
+xmake run quarkpp -- --help
+xmake run quarkpp -- account
+xmake run quarkpp -- ls
+xmake run quarkpp -- ls --path /视频
+xmake run quarkpp -- upload ./movie.mkv --to-path /视频 --name movie-final.mkv
+xmake run quarkpp -- download --path /视频 --out ./downloads
+xmake run quarkpp -- share-create --path /视频/电影合集 --expire 7d --passcode 1234
+xmake run quarkpp -- transfer "https://pan.quark.cn/s/xxxx" --passcode 1234 --to-path /收藏
 ```
 
-## 命令示例
+## 安装
 
-查看帮助：
+已经支持 `xmake install`。示例：
 
-```powershell
-build\windows\x64\release\quarkpp.exe --help
+```sh
+xmake install -o ./dist
 ```
 
-查看账号：
+安装后默认会包含：
 
-```powershell
-build\windows\x64\release\quarkpp.exe account
-```
+- 可执行文件
+- [config/quarkpp.example.json](config/quarkpp.example.json)
+- 中文/英文 README
+- `LICENSE`
 
-列出根目录：
-
-```powershell
-build\windows\x64\release\quarkpp.exe ls
-```
-
-按远端路径列目录：
-
-```powershell
-build\windows\x64\release\quarkpp.exe ls --path /视频
-```
-
-上传文件到根目录：
-
-```powershell
-build\windows\x64\release\quarkpp.exe upload .\movie.mkv
-```
-
-上传文件到指定目录：
-
-```powershell
-build\windows\x64\release\quarkpp.exe upload .\movie.mkv --to-path /视频 --name movie-final.mkv
-```
-
-下载整个远端目录：
-
-```powershell
-build\windows\x64\release\quarkpp.exe download --path /视频 --out .\downloads
-```
-
-创建分享：
-
-```powershell
-build\windows\x64\release\quarkpp.exe share-create --path /视频/电影合集 --expire 7d --passcode 1234
-```
-
-转存分享：
-
-```powershell
-build\windows\x64\release\quarkpp.exe transfer "https://pan.quark.cn/s/xxxx" --passcode 1234 --to-path /收藏
-```
+这些文件会被安装到 `./dist/bin` 和 `./dist/share/quarkpp` 下。
 
 ## 大文件说明
 
@@ -138,9 +103,11 @@ build\windows\x64\release\quarkpp.exe transfer "https://pan.quark.cn/s/xxxx" --p
 - 已存在文件的断点续传
 - 目录递归下载
 
-## 注意
+## 编码说明
 
-- 这是 CLI 客户端，目前没有 GUI。
-- 由于使用了网页接口，夸克后续改接口时可能需要跟进。
-- 我没有把真实 cookie 写进仓库文件；请只放到本地忽略配置或环境变量里。
-- 当前代码已经去掉 Windows 专属网络与加密实现；如果后续要在 Linux/macOS 上正式发布，主要剩下 CI、打包和实际运行验证。
+已经补了两层 UTF-8 处理：
+
+- 构建时显式使用 UTF-8 源码/执行字符集编译
+- Windows 下命令行参数改为宽字符读取后转 UTF-8，减少中文路径和中文输出乱码问题
+
+如果你后面要在 Linux/macOS 上继续验证，重点就是再做一轮不同终端与不同 locale 下的实机测试。

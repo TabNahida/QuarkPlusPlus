@@ -1,5 +1,6 @@
 #include "quark_client.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -10,11 +11,89 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#include <shellapi.h>
+#endif
+
 namespace quarkpp {
 
 namespace {
 
 using ArgList = std::vector<std::string>;
+
+#if defined(_WIN32)
+[[nodiscard]] std::string wide_to_utf8(std::wstring_view value) {
+    if (value.empty()) {
+        return {};
+    }
+
+    const auto size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (size <= 0) {
+        throw QuarkException("宽字符转 UTF-8 失败");
+    }
+
+    std::string result(static_cast<std::size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size, nullptr, nullptr);
+    return result;
+}
+
+[[nodiscard]] std::wstring utf8_to_wide(std::string_view value) {
+    if (value.empty()) {
+        return {};
+    }
+
+    const auto size = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+    if (size <= 0) {
+        throw QuarkException("UTF-8 转宽字符失败");
+    }
+
+    std::wstring result(static_cast<std::size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size);
+    return result;
+}
+#endif
+
+[[nodiscard]] std::filesystem::path path_from_utf8(std::string_view value) {
+#if defined(_WIN32)
+    return std::filesystem::path(utf8_to_wide(value));
+#else
+    return std::filesystem::path(std::string(value));
+#endif
+}
+
+void init_console_encoding() {
+#if defined(_WIN32)
+    SetConsoleCP(CP_UTF8);
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+}
+
+[[nodiscard]] ArgList collect_args(int argc, char** argv) {
+#if defined(_WIN32)
+    int wide_argc = 0;
+    LPWSTR* wide_argv = CommandLineToArgvW(GetCommandLineW(), &wide_argc);
+    if (wide_argv != nullptr) {
+        ArgList args;
+        args.reserve(static_cast<std::size_t>(std::max(0, wide_argc - 1)));
+        for (int index = 1; index < wide_argc; ++index) {
+            args.push_back(wide_to_utf8(wide_argv[index]));
+        }
+        LocalFree(wide_argv);
+        return args;
+    }
+#endif
+
+    ArgList args;
+    args.reserve(static_cast<std::size_t>(std::max(0, argc - 1)));
+    for (int index = 1; index < argc; ++index) {
+        args.emplace_back(argv[index]);
+    }
+    return args;
+}
 
 [[nodiscard]] std::optional<std::string> getenv_string(const char* name) {
 #if defined(_WIN32)
@@ -104,7 +183,7 @@ void print_help() {
 
 [[nodiscard]] AppConfig load_config(const std::optional<std::string>& config_path_override) {
     AppConfig config;
-    const auto config_path = std::filesystem::path(config_path_override.value_or(
+    const auto config_path = path_from_utf8(config_path_override.value_or(
         getenv_string("QUARKPP_CONFIG").value_or("config/quarkpp.local.json")));
 
     if (std::filesystem::exists(config_path)) {
@@ -115,7 +194,7 @@ void print_help() {
         json file_config = json::parse(input);
         config.cookie = file_config.value("cookie", "");
         config.user_agent = file_config.value("user_agent", "");
-        config.download_dir = file_config.value("download_dir", "downloads");
+        config.download_dir = path_from_utf8(file_config.value("download_dir", "downloads"));
         config.request_timeout_ms = file_config.value("request_timeout_ms", 120000U);
         config.upload_retry_count = file_config.value("upload_retry_count", 3);
     }
@@ -200,10 +279,8 @@ int main(int argc, char** argv) {
     using namespace quarkpp;
 
     try {
-        ArgList args;
-        for (int index = 1; index < argc; ++index) {
-            args.emplace_back(argv[index]);
-        }
+        init_console_encoding();
+        auto args = collect_args(argc, argv);
 
         const bool json_output = consume_flag(args, "--json");
         const auto config_path = consume_option(args, "--config");
@@ -298,7 +375,7 @@ int main(int argc, char** argv) {
             const auto local_file = require_positional(args, "local-file");
             const auto target_fid = resolve_fid(client, args, std::string("0"), "--to-fid", "--to-path");
             const auto remote_name = consume_option(args, "--name");
-            const auto result = client.upload_file(local_file, target_fid, remote_name);
+            const auto result = client.upload_file(path_from_utf8(local_file), target_fid, remote_name);
             json output {
                 {"fid", result.fid},
                 {"file_name", result.file_name},
@@ -311,11 +388,12 @@ int main(int argc, char** argv) {
 
         if (command == "download") {
             const auto fid = resolve_fid(client, args);
-            const auto out_dir = consume_option(args, "--out").value_or(client.config().download_dir.string());
+            const auto out_dir = consume_option(args, "--out");
             const bool resume = !consume_flag(args, "--no-resume");
-            client.download(fid, out_dir, resume);
+            const auto output_dir = out_dir ? path_from_utf8(*out_dir) : client.config().download_dir;
+            client.download(fid, output_dir, resume);
             if (json_output) {
-                std::cout << json {{"status", "ok"}, {"output", out_dir}}.dump(2) << '\n';
+                std::cout << json {{"status", "ok"}, {"output", output_dir.string()}}.dump(2) << '\n';
             }
             return 0;
         }
