@@ -2,7 +2,7 @@
 
 `QuarkPlusPlus` 是一个基于 `xmake` 和 `C++23` 的夸克网盘第三方 CLI 客户端。
 
-当前实现面向 Windows，使用系统自带的 `WinHTTP / BCrypt / Crypt32` 完成 HTTPS、哈希和 Base64 处理；JSON 解析使用 `nlohmann_json`。
+当前实现使用 `libcurl + OpenSSL + nlohmann_json`，不再依赖 `WinHTTP / BCrypt / Crypt32` 这类 Windows 专属库。只要 `xmake` 能拉到对应包，代码本身就是按跨平台方向组织的。
 
 ## 已实现能力
 
@@ -58,7 +58,7 @@ xmake f -y -m release
 xmake build -y
 ```
 
-可执行文件默认位于：
+Windows 下可执行文件默认位于：
 
 ```text
 build/windows/x64/release/quarkpp.exe
@@ -143,3 +143,4 @@ build\windows\x64\release\quarkpp.exe transfer "https://pan.quark.cn/s/xxxx" --p
 - 这是 CLI 客户端，目前没有 GUI。
 - 由于使用了网页接口，夸克后续改接口时可能需要跟进。
 - 我没有把真实 cookie 写进仓库文件；请只放到本地忽略配置或环境变量里。
+- 当前代码已经去掉 Windows 专属网络与加密实现；如果后续要在 Linux/macOS 上正式发布，主要剩下 CI、打包和实际运行验证。

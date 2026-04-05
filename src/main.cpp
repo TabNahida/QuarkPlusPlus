@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -16,10 +17,20 @@ namespace {
 using ArgList = std::vector<std::string>;
 
 [[nodiscard]] std::optional<std::string> getenv_string(const char* name) {
+#if defined(_WIN32)
+    char* value = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&value, &length, name) != 0 || value == nullptr || length == 0) {
+        return std::nullopt;
+    }
+    std::unique_ptr<char, decltype(&std::free)> holder(value, &std::free);
+    return std::string(holder.get());
+#else
     if (const auto* value = std::getenv(name); value != nullptr && *value != '\0') {
         return std::string(value);
     }
     return std::nullopt;
+#endif
 }
 
 [[nodiscard]] bool consume_flag(ArgList& args, std::string_view flag) {

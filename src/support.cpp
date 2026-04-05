@@ -1,99 +1,74 @@
 #include "support.h"
 
-#include <Windows.h>
-#include <bcrypt.h>
-#include <wincrypt.h>
-#include <winhttp.h>
+#include <curl/curl.h>
+#include <openssl/evp.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <ranges>
 #include <sstream>
-
-#pragma comment(lib, "bcrypt.lib")
-#pragma comment(lib, "crypt32.lib")
-#pragma comment(lib, "winhttp.lib")
 
 namespace quarkpp {
 
 namespace {
 
-struct WinHttpCloser {
-    void operator()(void* handle) const noexcept {
+struct CurlGlobalInit {
+    CurlGlobalInit() {
+        const auto code = curl_global_init(CURL_GLOBAL_DEFAULT);
+        if (code != CURLE_OK) {
+            throw QuarkException(std::string("curl_global_init 失败: ") + curl_easy_strerror(code));
+        }
+    }
+
+    ~CurlGlobalInit() {
+        curl_global_cleanup();
+    }
+};
+
+struct CurlDeleter {
+    void operator()(CURL* handle) const noexcept {
         if (handle != nullptr) {
-            WinHttpCloseHandle(static_cast<HINTERNET>(handle));
+            curl_easy_cleanup(handle);
         }
     }
 };
 
-using UniqueHInternet = std::unique_ptr<void, WinHttpCloser>;
-
-struct ParsedUrl {
-    std::wstring host;
-    std::wstring path_and_query;
-    INTERNET_PORT port {};
-    bool secure {false};
+struct CurlSlistDeleter {
+    void operator()(curl_slist* list) const noexcept {
+        if (list != nullptr) {
+            curl_slist_free_all(list);
+        }
+    }
 };
 
-[[nodiscard]] std::wstring utf8_to_wide(const std::string& value) {
-    if (value.empty()) {
-        return {};
-    }
+using UniqueCurl = std::unique_ptr<CURL, CurlDeleter>;
+using UniqueCurlSlist = std::unique_ptr<curl_slist, CurlSlistDeleter>;
 
-    const auto size = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0);
-    if (size <= 0) {
-        throw QuarkException("UTF-8 转宽字符失败");
-    }
+struct UploadState {
+    std::ifstream file;
+    std::uint64_t remaining {};
+    std::uint64_t transferred {};
+    ProgressCallback progress;
+};
 
-    std::wstring result(static_cast<std::size_t>(size), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), result.data(), size);
-    return result;
-}
+struct DownloadState {
+    std::ofstream* stream {nullptr};
+    std::uint64_t base_offset {};
+    ProgressCallback progress;
+};
 
-[[nodiscard]] std::string wide_to_utf8(const std::wstring& value) {
-    if (value.empty()) {
-        return {};
-    }
-
-    const auto size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    if (size <= 0) {
-        throw QuarkException("宽字符转 UTF-8 失败");
-    }
-
-    std::string result(static_cast<std::size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), result.data(), size, nullptr, nullptr);
-    return result;
-}
-
-[[nodiscard]] std::string last_error_message(const std::string& prefix) {
-    const auto error = GetLastError();
-    LPSTR buffer = nullptr;
-    const auto length = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                                       nullptr,
-                                       error,
-                                       MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                                       reinterpret_cast<LPSTR>(&buffer),
-                                       0,
-                                       nullptr);
-
-    std::string message = prefix + " (Win32=" + std::to_string(error) + ")";
-    if (length > 0 && buffer != nullptr) {
-        message += ": ";
-        message += trim(buffer);
-        LocalFree(buffer);
-    }
-    return message;
-}
-
-[[noreturn]] void throw_last_error(const std::string& prefix) {
-    throw QuarkException(last_error_message(prefix));
+[[nodiscard]] CurlGlobalInit& curl_global_state() {
+    static CurlGlobalInit instance;
+    return instance;
 }
 
 [[nodiscard]] std::string append_query(const std::string& url, const QueryList& query) {
@@ -116,187 +91,99 @@ struct ParsedUrl {
     return builder.str();
 }
 
-[[nodiscard]] ParsedUrl parse_url(const std::string& url) {
-    auto wide_url = utf8_to_wide(url);
-
-    URL_COMPONENTS components {};
-    components.dwStructSize = sizeof(components);
-    components.dwHostNameLength = static_cast<DWORD>(-1);
-    components.dwUrlPathLength = static_cast<DWORD>(-1);
-    components.dwExtraInfoLength = static_cast<DWORD>(-1);
-    components.dwSchemeLength = static_cast<DWORD>(-1);
-
-    if (!WinHttpCrackUrl(wide_url.c_str(), static_cast<DWORD>(wide_url.size()), 0, &components)) {
-        throw_last_error("解析 URL 失败");
+[[nodiscard]] UniqueCurl make_curl() {
+    static_cast<void>(curl_global_state());
+    UniqueCurl handle(curl_easy_init());
+    if (!handle) {
+        throw QuarkException("curl_easy_init 失败");
     }
-
-    ParsedUrl parsed;
-    parsed.host.assign(components.lpszHostName, components.dwHostNameLength);
-    parsed.port = components.nPort;
-    parsed.secure = components.nScheme == INTERNET_SCHEME_HTTPS;
-
-    std::wstring path;
-    if (components.dwUrlPathLength > 0) {
-        path.assign(components.lpszUrlPath, components.dwUrlPathLength);
-    } else {
-        path = L"/";
-    }
-    if (components.dwExtraInfoLength > 0) {
-        path.append(components.lpszExtraInfo, components.dwExtraInfoLength);
-    }
-    parsed.path_and_query = std::move(path);
-    return parsed;
+    return handle;
 }
 
-[[nodiscard]] UniqueHInternet open_session(unsigned timeout_ms) {
-    UniqueHInternet session(WinHttpOpen(L"QuarkPlusPlus/0.1",
-                                        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                        WINHTTP_NO_PROXY_NAME,
-                                        WINHTTP_NO_PROXY_BYPASS,
-                                        0));
-    if (!session) {
-        throw_last_error("WinHttpOpen 失败");
-    }
-
-    WinHttpSetTimeouts(static_cast<HINTERNET>(session.get()),
-                       static_cast<int>(timeout_ms),
-                       static_cast<int>(timeout_ms),
-                       static_cast<int>(timeout_ms),
-                       static_cast<int>(timeout_ms));
-    return session;
-}
-
-[[nodiscard]] std::wstring build_header_block(const HeaderList& headers) {
-    std::wstring block;
+[[nodiscard]] UniqueCurlSlist make_headers(const HeaderList& headers) {
+    curl_slist* list = nullptr;
     for (const auto& [key, value] : headers) {
-        block += utf8_to_wide(key);
-        block += L": ";
-        block += utf8_to_wide(value);
-        block += L"\r\n";
-    }
-    return block;
-}
-
-void add_headers(HINTERNET request, const HeaderList& headers) {
-    if (headers.empty()) {
-        return;
-    }
-
-    const auto header_block = build_header_block(headers);
-    if (!WinHttpAddRequestHeaders(request, header_block.c_str(), static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD)) {
-        throw_last_error("添加请求头失败");
-    }
-}
-
-[[nodiscard]] std::unordered_map<std::string, std::string> parse_response_headers(HINTERNET request) {
-    DWORD size = 0;
-    WinHttpQueryHeaders(request, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &size, WINHTTP_NO_HEADER_INDEX);
-    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-        throw_last_error("读取响应头大小失败");
-    }
-
-    std::wstring raw(static_cast<std::size_t>(size / sizeof(wchar_t)), L'\0');
-    if (!WinHttpQueryHeaders(request,
-                             WINHTTP_QUERY_RAW_HEADERS_CRLF,
-                             WINHTTP_HEADER_NAME_BY_INDEX,
-                             raw.data(),
-                             &size,
-                             WINHTTP_NO_HEADER_INDEX)) {
-        throw_last_error("读取响应头失败");
-    }
-
-    std::unordered_map<std::string, std::string> headers;
-    std::stringstream stream(wide_to_utf8(raw));
-    std::string line;
-    while (std::getline(stream, line)) {
-        line = trim(line);
-        if (line.empty() || line.starts_with("HTTP/")) {
-            continue;
+        const auto header = key + ": " + value;
+        list = curl_slist_append(list, header.c_str());
+        if (list == nullptr) {
+            throw QuarkException("构建请求头失败");
         }
+    }
+    return UniqueCurlSlist(list);
+}
+
+void set_common_curl_options(CURL* curl, unsigned timeout_ms, HttpResponse& response) {
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(timeout_ms));
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_ms));
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](char* ptr, std::size_t size, std::size_t nmemb, void* userdata) -> std::size_t {
+        auto* body = static_cast<std::string*>(userdata);
+        body->append(ptr, size * nmemb);
+        return size * nmemb;
+    });
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, +[](char* buffer, std::size_t size, std::size_t nitems, void* userdata) -> std::size_t {
+        const std::size_t total = size * nitems;
+        auto* response_ptr = static_cast<HttpResponse*>(userdata);
+        std::string_view line(buffer, total);
         const auto separator = line.find(':');
-        if (separator == std::string::npos) {
-            continue;
+        if (separator != std::string_view::npos) {
+            auto key = to_lower(trim(line.substr(0, separator)));
+            auto value = trim(line.substr(separator + 1));
+            if (!key.empty()) {
+                response_ptr->headers[key] = value;
+            }
         }
-        headers[to_lower(trim(line.substr(0, separator)))] = trim(line.substr(separator + 1));
-    }
-    return headers;
+        return total;
+    });
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response);
 }
 
-[[nodiscard]] int query_status_code(HINTERNET request) {
-    DWORD code = 0;
-    DWORD size = sizeof(code);
-    if (!WinHttpQueryHeaders(request,
-                             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX,
-                             &code,
-                             &size,
-                             WINHTTP_NO_HEADER_INDEX)) {
-        throw_last_error("读取状态码失败");
+void finalize_response(CURL* curl, HttpResponse& response) {
+    long status_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+    response.status_code = static_cast<int>(status_code);
+
+    char* effective_url = nullptr;
+    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
+    if (effective_url != nullptr) {
+        response.url = effective_url;
     }
-    return static_cast<int>(code);
 }
 
-[[nodiscard]] std::string read_response_body(HINTERNET request) {
-    std::string body;
-    for (;;) {
-        DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request, &available)) {
-            throw_last_error("读取响应数据长度失败");
-        }
-        if (available == 0) {
-            break;
-        }
+void perform_checked(CURL* curl, const std::string& action, HttpResponse& response) {
+    char error_buffer[CURL_ERROR_SIZE] = {};
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
 
-        std::string chunk(static_cast<std::size_t>(available), '\0');
-        DWORD read = 0;
-        if (!WinHttpReadData(request, chunk.data(), available, &read)) {
-            throw_last_error("读取响应数据失败");
+    const auto code = curl_easy_perform(curl);
+    if (code != CURLE_OK) {
+        std::string message = action + "失败: " + curl_easy_strerror(code);
+        if (error_buffer[0] != '\0') {
+            message += " | ";
+            message += error_buffer;
         }
-        chunk.resize(read);
-        body.append(chunk);
+        throw QuarkException(message);
     }
-    return body;
+
+    finalize_response(curl, response);
 }
 
-[[nodiscard]] std::vector<unsigned char> compute_digest(const std::filesystem::path& file_path, const wchar_t* algorithm) {
-    BCRYPT_ALG_HANDLE algorithm_handle = nullptr;
-    BCRYPT_HASH_HANDLE hash_handle = nullptr;
-
-    auto cleanup = [&]() {
-        if (hash_handle != nullptr) {
-            BCryptDestroyHash(hash_handle);
-        }
-        if (algorithm_handle != nullptr) {
-            BCryptCloseAlgorithmProvider(algorithm_handle, 0);
-        }
-    };
-
-    if (BCryptOpenAlgorithmProvider(&algorithm_handle, algorithm, nullptr, 0) != 0) {
-        cleanup();
-        throw QuarkException("初始化哈希算法失败");
-    }
-
-    DWORD hash_length = 0;
-    DWORD result_size = 0;
-    if (BCryptGetProperty(algorithm_handle,
-                          BCRYPT_HASH_LENGTH,
-                          reinterpret_cast<PUCHAR>(&hash_length),
-                          sizeof(hash_length),
-                          &result_size,
-                          0) != 0) {
-        cleanup();
-        throw QuarkException("读取哈希长度失败");
-    }
-
-    if (BCryptCreateHash(algorithm_handle, &hash_handle, nullptr, 0, nullptr, 0, 0) != 0) {
-        cleanup();
-        throw QuarkException("创建哈希上下文失败");
-    }
-
+[[nodiscard]] std::string digest_to_hex(const std::filesystem::path& file_path, const EVP_MD* algorithm) {
     std::ifstream input(file_path, std::ios::binary);
     if (!input) {
-        cleanup();
         throw QuarkException("无法打开文件用于哈希计算: " + file_path.string());
+    }
+
+    using EvpCtx = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+    EvpCtx ctx(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+    if (!ctx) {
+        throw QuarkException("创建 OpenSSL 哈希上下文失败");
+    }
+    if (EVP_DigestInit_ex(ctx.get(), algorithm, nullptr) != 1) {
+        throw QuarkException("初始化 OpenSSL 哈希失败");
     }
 
     std::vector<char> buffer(8 * 1024 * 1024);
@@ -306,59 +193,85 @@ void add_headers(HINTERNET request, const HeaderList& headers) {
         if (read <= 0) {
             break;
         }
-        if (BCryptHashData(hash_handle,
-                           reinterpret_cast<PUCHAR>(buffer.data()),
-                           static_cast<ULONG>(read),
-                           0) != 0) {
-            cleanup();
-            throw QuarkException("写入哈希数据失败");
+        if (EVP_DigestUpdate(ctx.get(), buffer.data(), static_cast<std::size_t>(read)) != 1) {
+            throw QuarkException("更新 OpenSSL 哈希失败");
         }
     }
 
-    std::vector<unsigned char> digest(hash_length);
-    if (BCryptFinishHash(hash_handle, digest.data(), hash_length, 0) != 0) {
-        cleanup();
-        throw QuarkException("完成哈希计算失败");
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest {};
+    unsigned digest_length = 0;
+    if (EVP_DigestFinal_ex(ctx.get(), digest.data(), &digest_length) != 1) {
+        throw QuarkException("完成 OpenSSL 哈希失败");
     }
 
-    cleanup();
-    return digest;
-}
-
-[[nodiscard]] std::string bytes_to_hex(const std::vector<unsigned char>& digest) {
     std::ostringstream output;
     output << std::hex << std::setfill('0');
-    for (const auto byte : digest) {
-        output << std::setw(2) << static_cast<int>(byte);
+    for (unsigned index = 0; index < digest_length; ++index) {
+        output << std::setw(2) << static_cast<int>(digest[index]);
     }
     return output.str();
 }
 
-[[nodiscard]] std::string base64_from_bytes(const unsigned char* data, DWORD size) {
-    DWORD encoded_size = 0;
-    if (!CryptBinaryToStringA(data, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &encoded_size)) {
-        throw QuarkException("Base64 编码长度计算失败");
-    }
-
+[[nodiscard]] std::string base64_from_bytes(const unsigned char* data, std::size_t size) {
+    const auto encoded_size = 4 * ((size + 2) / 3);
     std::string encoded(encoded_size, '\0');
-    if (!CryptBinaryToStringA(data, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, encoded.data(), &encoded_size)) {
-        throw QuarkException("Base64 编码失败");
+    const auto written = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(encoded.data()), data, static_cast<int>(size));
+    if (written < 0) {
+        throw QuarkException("OpenSSL Base64 编码失败");
     }
-    if (!encoded.empty() && encoded.back() == '\0') {
-        encoded.pop_back();
-    }
+    encoded.resize(static_cast<std::size_t>(written));
     return encoded;
 }
 
-[[nodiscard]] std::uint64_t parse_uint64_header(const std::unordered_map<std::string, std::string>& headers,
-                                                std::string_view key) {
-    const auto it = headers.find(std::string(key));
-    if (it == headers.end()) {
+std::size_t read_upload_callback(char* buffer, std::size_t size, std::size_t nmemb, void* userdata) {
+    auto* state = static_cast<UploadState*>(userdata);
+    if (state->remaining == 0) {
         return 0;
     }
-    std::uint64_t value = 0;
-    std::from_chars(it->second.data(), it->second.data() + it->second.size(), value);
-    return value;
+
+    const auto capacity = static_cast<std::uint64_t>(size * nmemb);
+    const auto to_read = static_cast<std::size_t>(std::min<std::uint64_t>(state->remaining, capacity));
+    state->file.read(buffer, static_cast<std::streamsize>(to_read));
+    const auto read = static_cast<std::size_t>(state->file.gcount());
+    state->remaining -= read;
+    state->transferred += read;
+    return read;
+}
+
+int xfer_info_callback(void* clientp,
+                       curl_off_t dltotal,
+                       curl_off_t dlnow,
+                       curl_off_t ultotal,
+                       curl_off_t ulnow) {
+    auto* state = static_cast<UploadState*>(clientp);
+    if (state != nullptr && state->progress) {
+        const auto total = ultotal > 0 ? static_cast<std::uint64_t>(ultotal) : state->transferred;
+        state->progress(static_cast<std::uint64_t>(ulnow), total);
+    }
+    return 0;
+}
+
+std::size_t write_download_callback(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
+    auto* state = static_cast<DownloadState*>(userdata);
+    const auto bytes = size * nmemb;
+    state->stream->write(ptr, static_cast<std::streamsize>(bytes));
+    return state->stream->good() ? bytes : 0;
+}
+
+int download_progress_callback(void* clientp,
+                               curl_off_t dltotal,
+                               curl_off_t dlnow,
+                               curl_off_t,
+                               curl_off_t) {
+    auto* state = static_cast<DownloadState*>(clientp);
+    if (state != nullptr && state->progress) {
+        const auto current = state->base_offset + static_cast<std::uint64_t>(std::max<curl_off_t>(0, dlnow));
+        const auto total = dltotal > 0
+                               ? state->base_offset + static_cast<std::uint64_t>(dltotal)
+                               : 0;
+        state->progress(current, total);
+    }
+    return 0;
 }
 
 }  // namespace
@@ -378,60 +291,34 @@ json HttpResponse::json_body() const {
     }
 }
 
-HttpClient::HttpClient(unsigned timeout_ms) : timeout_ms_(timeout_ms) {}
+HttpClient::HttpClient(unsigned timeout_ms) : timeout_ms_(timeout_ms) {
+    static_cast<void>(curl_global_state());
+}
 
 HttpResponse HttpClient::request(std::string method,
                                  const std::string& url,
                                  const QueryList& query,
                                  const HeaderList& headers,
                                  const std::string& body) const {
-    const auto full_url = append_query(url, query);
-    const auto parsed = parse_url(full_url);
-
-    auto session = open_session(timeout_ms_);
-    UniqueHInternet connection(WinHttpConnect(static_cast<HINTERNET>(session.get()),
-                                              parsed.host.c_str(),
-                                              parsed.port,
-                                              0));
-    if (!connection) {
-        throw_last_error("WinHttpConnect 失败");
-    }
-
-    const auto wide_method = utf8_to_wide(method);
-    UniqueHInternet request(WinHttpOpenRequest(static_cast<HINTERNET>(connection.get()),
-                                               wide_method.c_str(),
-                                               parsed.path_and_query.c_str(),
-                                               nullptr,
-                                               WINHTTP_NO_REFERER,
-                                               WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                               parsed.secure ? WINHTTP_FLAG_SECURE : 0));
-    if (!request) {
-        throw_last_error("WinHttpOpenRequest 失败");
-    }
-
-    add_headers(static_cast<HINTERNET>(request.get()), headers);
-
-    const auto total_length = body.empty() ? 0U : static_cast<DWORD>(body.size());
-    auto* body_ptr = body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(body.data());
-    if (!WinHttpSendRequest(static_cast<HINTERNET>(request.get()),
-                            WINHTTP_NO_ADDITIONAL_HEADERS,
-                            0,
-                            body_ptr,
-                            total_length,
-                            total_length,
-                            0)) {
-        throw_last_error("WinHttpSendRequest 失败");
-    }
-
-    if (!WinHttpReceiveResponse(static_cast<HINTERNET>(request.get()), nullptr)) {
-        throw_last_error("WinHttpReceiveResponse 失败");
-    }
-
     HttpResponse response;
-    response.status_code = query_status_code(static_cast<HINTERNET>(request.get()));
-    response.headers = parse_response_headers(static_cast<HINTERNET>(request.get()));
-    response.body = read_response_body(static_cast<HINTERNET>(request.get()));
-    response.url = full_url;
+    const auto full_url = append_query(url, query);
+    auto curl = make_curl();
+    auto header_list = make_headers(headers);
+
+    curl_easy_setopt(curl.get(), CURLOPT_URL, full_url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_list.get());
+    curl_easy_setopt(curl.get(), CURLOPT_CUSTOMREQUEST, method.c_str());
+    set_common_curl_options(curl.get(), timeout_ms_, response);
+
+    if (!body.empty()) {
+        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, body.data());
+        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
+    } else if (method == "POST") {
+        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, "");
+        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(0));
+    }
+
+    perform_checked(curl.get(), "HTTP 请求", response);
     return response;
 }
 
@@ -442,80 +329,36 @@ HttpResponse HttpClient::upload_file_range(const std::string& url,
                                            std::uint64_t offset,
                                            std::uint64_t length,
                                            const ProgressCallback& progress) const {
-    if (length > static_cast<std::uint64_t>(std::numeric_limits<DWORD>::max())) {
-        throw QuarkException("单个上传分片超过 WinHTTP 支持的范围");
-    }
-
-    const auto full_url = append_query(url, query);
-    const auto parsed = parse_url(full_url);
-
-    auto session = open_session(timeout_ms_);
-    UniqueHInternet connection(WinHttpConnect(static_cast<HINTERNET>(session.get()),
-                                              parsed.host.c_str(),
-                                              parsed.port,
-                                              0));
-    if (!connection) {
-        throw_last_error("WinHttpConnect 失败");
-    }
-
-    UniqueHInternet request(WinHttpOpenRequest(static_cast<HINTERNET>(connection.get()),
-                                               L"PUT",
-                                               parsed.path_and_query.c_str(),
-                                               nullptr,
-                                               WINHTTP_NO_REFERER,
-                                               WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                               parsed.secure ? WINHTTP_FLAG_SECURE : 0));
-    if (!request) {
-        throw_last_error("WinHttpOpenRequest 失败");
-    }
-
-    add_headers(static_cast<HINTERNET>(request.get()), headers);
-
-    if (!WinHttpSendRequest(static_cast<HINTERNET>(request.get()),
-                            WINHTTP_NO_ADDITIONAL_HEADERS,
-                            0,
-                            WINHTTP_NO_REQUEST_DATA,
-                            0,
-                            static_cast<DWORD>(length),
-                            0)) {
-        throw_last_error("上传请求发送失败");
-    }
-
-    std::ifstream input(file_path, std::ios::binary);
-    if (!input) {
+    UploadState state;
+    state.file.open(file_path, std::ios::binary);
+    if (!state.file) {
         throw QuarkException("无法打开上传文件: " + file_path.string());
     }
-    input.seekg(static_cast<std::streamoff>(offset));
-
-    std::vector<char> buffer(1024 * 1024);
-    std::uint64_t sent = 0;
-    while (sent < length) {
-        const auto chunk_size = static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(), length - sent));
-        input.read(buffer.data(), static_cast<std::streamsize>(chunk_size));
-        const auto read = static_cast<std::size_t>(input.gcount());
-        if (read == 0) {
-            throw QuarkException("读取上传分片数据失败");
-        }
-
-        DWORD written = 0;
-        if (!WinHttpWriteData(static_cast<HINTERNET>(request.get()), buffer.data(), static_cast<DWORD>(read), &written)) {
-            throw_last_error("写入上传数据失败");
-        }
-        sent += written;
-        if (progress) {
-            progress(sent, length);
-        }
-    }
-
-    if (!WinHttpReceiveResponse(static_cast<HINTERNET>(request.get()), nullptr)) {
-        throw_last_error("上传响应接收失败");
-    }
+    state.file.seekg(static_cast<std::streamoff>(offset));
+    state.remaining = length;
+    state.transferred = 0;
+    state.progress = progress;
 
     HttpResponse response;
-    response.status_code = query_status_code(static_cast<HINTERNET>(request.get()));
-    response.headers = parse_response_headers(static_cast<HINTERNET>(request.get()));
-    response.body = read_response_body(static_cast<HINTERNET>(request.get()));
-    response.url = full_url;
+    const auto full_url = append_query(url, query);
+    auto curl = make_curl();
+    auto header_list = make_headers(headers);
+
+    curl_easy_setopt(curl.get(), CURLOPT_URL, full_url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_list.get());
+    curl_easy_setopt(curl.get(), CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(length));
+    curl_easy_setopt(curl.get(), CURLOPT_READFUNCTION, &read_upload_callback);
+    curl_easy_setopt(curl.get(), CURLOPT_READDATA, &state);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, &xfer_info_callback);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &state);
+    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+    set_common_curl_options(curl.get(), timeout_ms_, response);
+
+    perform_checked(curl.get(), "分片上传", response);
+    if (progress) {
+        progress(length, length);
+    }
     return response;
 }
 
@@ -524,102 +367,64 @@ HttpResponse HttpClient::download_file(const std::string& url,
                                        const std::filesystem::path& output_path,
                                        bool resume,
                                        const ProgressCallback& progress) const {
-    auto request_headers = headers;
-    std::uint64_t resume_from = 0;
-    if (resume && std::filesystem::exists(output_path) && std::filesystem::is_regular_file(output_path)) {
-        resume_from = std::filesystem::file_size(output_path);
-        if (resume_from > 0) {
-            request_headers.emplace_back("Range", "bytes=" + std::to_string(resume_from) + "-");
-        }
-    }
-
-    const auto parsed = parse_url(url);
-    auto session = open_session(timeout_ms_);
-    UniqueHInternet connection(WinHttpConnect(static_cast<HINTERNET>(session.get()),
-                                              parsed.host.c_str(),
-                                              parsed.port,
-                                              0));
-    if (!connection) {
-        throw_last_error("WinHttpConnect 失败");
-    }
-
-    UniqueHInternet request(WinHttpOpenRequest(static_cast<HINTERNET>(connection.get()),
-                                               L"GET",
-                                               parsed.path_and_query.c_str(),
-                                               nullptr,
-                                               WINHTTP_NO_REFERER,
-                                               WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                               parsed.secure ? WINHTTP_FLAG_SECURE : 0));
-    if (!request) {
-        throw_last_error("WinHttpOpenRequest 失败");
-    }
-
-    add_headers(static_cast<HINTERNET>(request.get()), request_headers);
-
-    if (!WinHttpSendRequest(static_cast<HINTERNET>(request.get()),
-                            WINHTTP_NO_ADDITIONAL_HEADERS,
-                            0,
-                            WINHTTP_NO_REQUEST_DATA,
-                            0,
-                            0,
-                            0)) {
-        throw_last_error("下载请求发送失败");
-    }
-
-    if (!WinHttpReceiveResponse(static_cast<HINTERNET>(request.get()), nullptr)) {
-        throw_last_error("下载响应接收失败");
-    }
-
-    HttpResponse response;
-    response.status_code = query_status_code(static_cast<HINTERNET>(request.get()));
-    response.headers = parse_response_headers(static_cast<HINTERNET>(request.get()));
-    response.url = url;
-
-    if (response.status_code == 416) {
-        return response;
-    }
-    if (response.status_code < 200 || response.status_code >= 300) {
-        response.body = read_response_body(static_cast<HINTERNET>(request.get()));
-        return response;
-    }
-
     std::filesystem::create_directories(output_path.parent_path());
-    const bool append = resume_from > 0 && response.status_code == 206;
-    if (!append) {
-        resume_from = 0;
+
+    std::uint64_t base_offset = 0;
+    if (resume && std::filesystem::exists(output_path) && std::filesystem::is_regular_file(output_path)) {
+        base_offset = std::filesystem::file_size(output_path);
     }
 
-    std::ofstream output(output_path,
-                         std::ios::binary | (append ? std::ios::app : std::ios::trunc));
-    if (!output) {
+    std::ofstream file(output_path,
+                       std::ios::binary | (base_offset > 0 ? std::ios::app : std::ios::trunc));
+    if (!file) {
         throw QuarkException("无法打开下载输出文件: " + output_path.string());
     }
 
-    const auto content_length = parse_uint64_header(response.headers, "content-length");
-    const auto total = content_length == 0 ? 0 : content_length + resume_from;
-    std::uint64_t received = resume_from;
+    DownloadState state {
+        .stream = &file,
+        .base_offset = base_offset,
+        .progress = progress,
+    };
 
-    for (;;) {
-        DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(static_cast<HINTERNET>(request.get()), &available)) {
-            throw_last_error("查询下载数据长度失败");
-        }
-        if (available == 0) {
-            break;
-        }
-
-        std::string chunk(static_cast<std::size_t>(available), '\0');
-        DWORD read = 0;
-        if (!WinHttpReadData(static_cast<HINTERNET>(request.get()), chunk.data(), available, &read)) {
-            throw_last_error("读取下载数据失败");
-        }
-        output.write(chunk.data(), static_cast<std::streamsize>(read));
-        received += read;
-        if (progress) {
-            progress(received, total);
-        }
+    auto request_headers = headers;
+    if (base_offset > 0) {
+        request_headers.emplace_back("Range", "bytes=" + std::to_string(base_offset) + "-");
     }
 
+    HttpResponse response;
+    auto curl = make_curl();
+    auto header_list = make_headers(request_headers);
+
+    curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_list.get());
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, &write_download_callback);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &state);
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, +[](char* buffer, std::size_t size, std::size_t nitems, void* userdata) -> std::size_t {
+        const std::size_t total = size * nitems;
+        auto* response_ptr = static_cast<HttpResponse*>(userdata);
+        std::string_view line(buffer, total);
+        const auto separator = line.find(':');
+        if (separator != std::string_view::npos) {
+            auto key = to_lower(trim(line.substr(0, separator)));
+            auto value = trim(line.substr(separator + 1));
+            if (!key.empty()) {
+                response_ptr->headers[key] = value;
+            }
+        }
+        return total;
+    });
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &response);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, &download_progress_callback);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &state);
+    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(timeout_ms_));
+    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_ms_));
+    curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_ACCEPT_ENCODING, "");
+
+    perform_checked(curl.get(), "文件下载", response);
     return response;
 }
 
@@ -698,77 +503,35 @@ std::string url_encode(std::string_view value) {
 }
 
 std::string base64_encode(const std::string& value) {
-    return base64_from_bytes(reinterpret_cast<const unsigned char*>(value.data()), static_cast<DWORD>(value.size()));
+    return base64_from_bytes(reinterpret_cast<const unsigned char*>(value.data()), value.size());
 }
 
 std::string md5_base64(const std::string& value) {
-    BCRYPT_ALG_HANDLE algorithm_handle = nullptr;
-    BCRYPT_HASH_HANDLE hash_handle = nullptr;
-
-    auto cleanup = [&]() {
-        if (hash_handle != nullptr) {
-            BCryptDestroyHash(hash_handle);
-        }
-        if (algorithm_handle != nullptr) {
-            BCryptCloseAlgorithmProvider(algorithm_handle, 0);
-        }
-    };
-
-    if (BCryptOpenAlgorithmProvider(&algorithm_handle, BCRYPT_MD5_ALGORITHM, nullptr, 0) != 0) {
-        cleanup();
-        throw QuarkException("初始化 MD5 算法失败");
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest {};
+    unsigned digest_length = 0;
+    if (EVP_Digest(value.data(),
+                   value.size(),
+                   digest.data(),
+                   &digest_length,
+                   EVP_md5(),
+                   nullptr) != 1) {
+        throw QuarkException("OpenSSL MD5 失败");
     }
-
-    DWORD hash_length = 0;
-    DWORD result_size = 0;
-    if (BCryptGetProperty(algorithm_handle,
-                          BCRYPT_HASH_LENGTH,
-                          reinterpret_cast<PUCHAR>(&hash_length),
-                          sizeof(hash_length),
-                          &result_size,
-                          0) != 0) {
-        cleanup();
-        throw QuarkException("读取 MD5 长度失败");
-    }
-
-    if (BCryptCreateHash(algorithm_handle, &hash_handle, nullptr, 0, nullptr, 0, 0) != 0) {
-        cleanup();
-        throw QuarkException("创建 MD5 上下文失败");
-    }
-
-    if (BCryptHashData(hash_handle,
-                       reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
-                       static_cast<ULONG>(value.size()),
-                       0) != 0) {
-        cleanup();
-        throw QuarkException("写入 MD5 数据失败");
-    }
-
-    std::vector<unsigned char> digest(hash_length);
-    if (BCryptFinishHash(hash_handle, digest.data(), hash_length, 0) != 0) {
-        cleanup();
-        throw QuarkException("完成 MD5 失败");
-    }
-
-    cleanup();
-    return base64_from_bytes(digest.data(), hash_length);
+    return base64_from_bytes(digest.data(), digest_length);
 }
 
 std::string gmt_http_date_now() {
-    SYSTEMTIME utc {};
-    GetSystemTime(&utc);
-
-    std::tm time {};
-    time.tm_year = utc.wYear - 1900;
-    time.tm_mon = utc.wMonth - 1;
-    time.tm_mday = utc.wDay;
-    time.tm_hour = utc.wHour;
-    time.tm_min = utc.wMinute;
-    time.tm_sec = utc.wSecond;
+    const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm utc {};
+#if defined(_WIN32)
+    gmtime_s(&utc, &now);
+#else
+    gmtime_r(&now, &utc);
+#endif
 
     std::ostringstream output;
     output.imbue(std::locale::classic());
-    output << std::put_time(&time, "%a, %d %b %Y %H:%M:%S GMT");
+    output << std::put_time(&utc, "%a, %d %b %Y %H:%M:%S GMT");
     return output.str();
 }
 
@@ -787,10 +550,10 @@ std::string format_bytes(std::uint64_t bytes) {
 }
 
 HashDigests compute_file_hashes(const std::filesystem::path& file_path) {
-    HashDigests digests;
-    digests.md5_hex = bytes_to_hex(compute_digest(file_path, BCRYPT_MD5_ALGORITHM));
-    digests.sha1_hex = bytes_to_hex(compute_digest(file_path, BCRYPT_SHA1_ALGORITHM));
-    return digests;
+    return HashDigests {
+        .md5_hex = digest_to_hex(file_path, EVP_md5()),
+        .sha1_hex = digest_to_hex(file_path, EVP_sha1()),
+    };
 }
 
 std::uint64_t unix_time_milliseconds_now() {
