@@ -1,0 +1,15 @@
+/.xmake/
+/.xmake-global/
+/build/
+/downloads/
+/config/*.local.json
+/config/*.secret.json
+/compile_commands.json
+/.vscode/
+*.obj
+*.pdb
+*.ilk
+*.log
+*.tmp
+*.user
+Thumbs.db
