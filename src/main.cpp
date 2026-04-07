@@ -50,30 +50,7 @@ bool g_use_icons = true;
     WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size, nullptr, nullptr);
     return result;
 }
-
-[[nodiscard]] std::wstring utf8_to_wide(std::string_view value) {
-    if (value.empty()) {
-        return {};
-    }
-
-    const auto size = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
-    if (size <= 0) {
-        throw QuarkException("UTF-8 转宽字符失败");
-    }
-
-    std::wstring result(static_cast<std::size_t>(size), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size);
-    return result;
-}
 #endif
-
-[[nodiscard]] std::filesystem::path path_from_utf8(std::string_view value) {
-#if defined(_WIN32)
-    return std::filesystem::path(utf8_to_wide(value));
-#else
-    return std::filesystem::path(std::string(value));
-#endif
-}
 
 [[nodiscard]] std::optional<std::filesystem::path> executable_path() {
 #if defined(_WIN32)
@@ -129,6 +106,41 @@ bool g_use_icons = true;
         current = parent;
     }
     return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> project_root() {
+    if (const auto found = find_upwards(std::filesystem::current_path(), "xmake.lua")) {
+        return found->parent_path();
+    }
+
+    if (const auto exe = executable_path()) {
+        if (const auto found = find_upwards(exe->parent_path(), "xmake.lua")) {
+            return found->parent_path();
+        }
+    }
+
+    return std::nullopt;
+}
+
+[[nodiscard]] std::filesystem::path preferred_working_directory() {
+    if (const auto root = project_root()) {
+        return *root;
+    }
+    return std::filesystem::current_path();
+}
+
+[[nodiscard]] std::filesystem::path resolve_user_path(std::string_view raw_path) {
+    const auto requested = path_from_utf8(raw_path);
+    if (requested.is_absolute()) {
+        return requested;
+    }
+
+    const auto current_candidate = std::filesystem::current_path() / requested;
+    if (std::filesystem::exists(current_candidate)) {
+        return current_candidate;
+    }
+
+    return preferred_working_directory() / requested;
 }
 
 [[nodiscard]] std::filesystem::path resolve_config_path(const std::optional<std::string>& explicit_path) {
@@ -388,14 +400,16 @@ void print_help() {
     if (std::filesystem::exists(config_path)) {
         std::ifstream input(config_path);
         if (!input) {
-            throw QuarkException("无法打开配置文件: " + config_path.string());
+            throw QuarkException("无法打开配置文件: " + path_to_utf8(config_path));
         }
         json file_config = json::parse(input);
         config.cookie = file_config.value("cookie", "");
         config.user_agent = file_config.value("user_agent", "");
-        config.download_dir = path_from_utf8(file_config.value("download_dir", "downloads"));
+        config.download_dir = resolve_user_path(file_config.value("download_dir", "downloads"));
         config.request_timeout_ms = file_config.value("request_timeout_ms", 120000U);
         config.upload_retry_count = file_config.value("upload_retry_count", 3);
+    } else {
+        config.download_dir = preferred_working_directory() / config.download_dir;
     }
 
     if (const auto cookie = getenv_string("QUARKPP_COOKIE")) {
@@ -615,7 +629,7 @@ int run_app(ArgList args) {
         const auto local_file = require_positional(args, "local-file");
         const auto target_fid = resolve_fid(client, args, std::string("0"), "--to-fid", "--to-path");
         const auto remote_name = consume_option(args, "--name");
-        const auto result = client.upload_file(path_from_utf8(local_file), target_fid, remote_name);
+        const auto result = client.upload_file(resolve_user_path(local_file), target_fid, remote_name);
         json output {
             {"fid", result.fid},
             {"file_name", result.file_name},
@@ -630,10 +644,10 @@ int run_app(ArgList args) {
         const auto fid = resolve_fid(client, args);
         const auto out_dir = consume_option(args, "--out");
         const bool resume = !consume_flag(args, "--no-resume");
-        const auto output_dir = out_dir ? path_from_utf8(*out_dir) : client.config().download_dir;
+        const auto output_dir = out_dir ? resolve_user_path(*out_dir) : client.config().download_dir;
         client.download(fid, output_dir, resume);
         if (json_output) {
-            std::cout << json {{"status", "ok"}, {"output", output_dir.string()}}.dump(2) << '\n';
+            std::cout << json {{"status", "ok"}, {"output", path_to_utf8(output_dir)}}.dump(2) << '\n';
         }
         return 0;
     }

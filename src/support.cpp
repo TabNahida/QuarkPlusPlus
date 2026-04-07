@@ -17,6 +17,13 @@
 #include <ranges>
 #include <sstream>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#endif
+
 namespace quarkpp {
 
 namespace {
@@ -174,7 +181,7 @@ void perform_checked(CURL* curl, const std::string& action, HttpResponse& respon
 [[nodiscard]] std::string digest_to_hex(const std::filesystem::path& file_path, const EVP_MD* algorithm) {
     std::ifstream input(file_path, std::ios::binary);
     if (!input) {
-        throw QuarkException("无法打开文件用于哈希计算: " + file_path.string());
+        throw QuarkException("无法打开文件用于哈希计算: " + path_to_utf8(file_path));
     }
 
     using EvpCtx = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
@@ -274,9 +281,57 @@ int download_progress_callback(void* clientp,
     return 0;
 }
 
+#if defined(_WIN32)
+[[nodiscard]] std::string wide_to_utf8(std::wstring_view value) {
+    if (value.empty()) {
+        return {};
+    }
+
+    const auto size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (size <= 0) {
+        throw QuarkException("宽字符转 UTF-8 失败");
+    }
+
+    std::string result(static_cast<std::size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size, nullptr, nullptr);
+    return result;
+}
+
+[[nodiscard]] std::wstring utf8_to_wide(std::string_view value) {
+    if (value.empty()) {
+        return {};
+    }
+
+    const auto size = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+    if (size <= 0) {
+        throw QuarkException("UTF-8 转宽字符失败");
+    }
+
+    std::wstring result(static_cast<std::size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size);
+    return result;
+}
+#endif
+
 }  // namespace
 
 QuarkException::QuarkException(const std::string& message) : std::runtime_error(message) {}
+
+std::filesystem::path path_from_utf8(std::string_view value) {
+#if defined(_WIN32)
+    return std::filesystem::path(utf8_to_wide(value));
+#else
+    return std::filesystem::path(std::string(value));
+#endif
+}
+
+std::string path_to_utf8(const std::filesystem::path& value) {
+#if defined(_WIN32)
+    return wide_to_utf8(value.native());
+#else
+    return value.string();
+#endif
+}
 
 std::string HttpResponse::header(std::string_view key) const {
     const auto it = headers.find(to_lower(std::string(key)));
@@ -332,7 +387,7 @@ HttpResponse HttpClient::upload_file_range(const std::string& url,
     UploadState state;
     state.file.open(file_path, std::ios::binary);
     if (!state.file) {
-        throw QuarkException("无法打开上传文件: " + file_path.string());
+        throw QuarkException("无法打开上传文件: " + path_to_utf8(file_path));
     }
     state.file.seekg(static_cast<std::streamoff>(offset));
     state.remaining = length;
@@ -377,7 +432,7 @@ HttpResponse HttpClient::download_file(const std::string& url,
     std::ofstream file(output_path,
                        std::ios::binary | (base_offset > 0 ? std::ios::app : std::ios::trunc));
     if (!file) {
-        throw QuarkException("无法打开下载输出文件: " + output_path.string());
+        throw QuarkException("无法打开下载输出文件: " + path_to_utf8(output_path));
     }
 
     DownloadState state {

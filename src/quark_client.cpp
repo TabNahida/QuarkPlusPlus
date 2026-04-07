@@ -97,7 +97,7 @@ void ensure_api_success(const json& result, const std::string& action) {
 }
 
 [[nodiscard]] std::string detect_mime_type(const std::filesystem::path& path) {
-    const auto ext = to_lower(path.extension().string());
+    const auto ext = to_lower(path_to_utf8(path.extension()));
     if (ext == ".txt" || ext == ".log" || ext == ".md" || ext == ".json" || ext == ".yaml" || ext == ".yml") {
         return "text/plain";
     }
@@ -796,10 +796,10 @@ UploadResult QuarkClient::upload_file(const std::filesystem::path& local_path,
                                       const std::string& pdir_fid,
                                       const std::optional<std::string>& new_name) const {
     if (!std::filesystem::exists(local_path) || !std::filesystem::is_regular_file(local_path)) {
-        throw QuarkException("本地文件不存在: " + local_path.string());
+        throw QuarkException("本地文件不存在: " + path_to_utf8(local_path));
     }
 
-    const auto file_name = new_name.value_or(local_path.filename().string());
+    const auto file_name = new_name.value_or(path_to_utf8(local_path.filename()));
     const auto file_size = std::filesystem::file_size(local_path);
     const auto mime_type = detect_mime_type(local_path);
     const auto digests = compute_file_hashes(local_path);
@@ -875,9 +875,27 @@ std::unordered_map<std::string, std::string> QuarkClient::request_download_urls(
     query.emplace_back("guid", "");
 
     const json body {{"fids", fids}};
-    auto result = api_post_json(std::string(kApiBase) + "/file/download", body, query, download_api_headers(false));
-    if (result.value("code", 0) == 23018) {
-        result = api_post_json(std::string(kApiBase) + "/file/download", body, query, download_api_headers(true));
+    const auto request_download = [&](bool desktop_ua) -> std::pair<HttpResponse, json> {
+        auto headers = download_api_headers(desktop_ua);
+        auto response = http_.request("POST", std::string(kApiBase) + "/file/download", query, headers, body.dump());
+        json result;
+        if (!response.body.empty()) {
+            result = response.json_body();
+        }
+        return {std::move(response), std::move(result)};
+    };
+
+    auto [response, result] = request_download(false);
+    const auto result_code = result.is_object() ? result.value("code", -1) : -1;
+    const auto result_message = result.is_object() ? result.value("message", "") : std::string();
+    if (result_code == 23018 || result_message.contains("download file size limit")) {
+        std::tie(response, result) = request_download(true);
+    }
+
+    if (response.status_code < 200 || response.status_code >= 300) {
+        auto detail = summarize_http_error(response);
+        throw QuarkException("HTTP POST 失败: " + std::to_string(response.status_code) +
+                             (detail.empty() ? std::string() : " | " + detail));
     }
     ensure_api_success(result, "获取下载链接");
 
@@ -894,7 +912,7 @@ void QuarkClient::collect_download_targets_recursive(const RemoteEntry& entry,
     if (!entry.dir) {
         output.push_back(DownloadTarget {
             .fid = entry.fid,
-            .relative_path = base / entry.name,
+            .relative_path = base / path_from_utf8(entry.name),
             .size = entry.size,
         });
         return;
@@ -944,7 +962,7 @@ void QuarkClient::download(const std::string& fid,
             }
 
             const auto destination = output_root / target.relative_path;
-            ProgressBar progress_bar("download " + target.relative_path.filename().string());
+            ProgressBar progress_bar("download " + path_to_utf8(target.relative_path.filename()));
             const auto response = http_.download_file(it->second,
                                                       file_download_headers(),
                                                       destination,
@@ -954,7 +972,7 @@ void QuarkClient::download(const std::string& fid,
                                                       });
             progress_bar.finish();
             if (response.status_code == 416) {
-                std::cout << destination.string() << " already complete\n";
+                std::cout << path_to_utf8(destination) << " already complete\n";
                 continue;
             }
             if (response.status_code < 200 || response.status_code >= 300) {

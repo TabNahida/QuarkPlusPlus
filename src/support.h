@@ -91,5 +91,7 @@ private:
 [[nodiscard]] HashDigests compute_file_hashes(const std::filesystem::path& file_path);
 [[nodiscard]] std::uint64_t unix_time_milliseconds_now();
 [[nodiscard]] std::vector<std::string> split_remote_path(std::string_view remote_path);
+[[nodiscard]] std::filesystem::path path_from_utf8(std::string_view value);
+[[nodiscard]] std::string path_to_utf8(const std::filesystem::path& value);
 
 }  // namespace quarkpp
