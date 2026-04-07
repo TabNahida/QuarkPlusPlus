@@ -2,9 +2,7 @@
 
 # QuarkPlusPlus
 
-`QuarkPlusPlus` 是一个基于 `xmake` 和 `C++23` 的夸克网盘第三方 CLI 客户端。
-
-当前实现使用 `libcurl + OpenSSL + nlohmann_json`，不依赖 `WinHTTP / BCrypt / Crypt32` 这类 Windows 专属库。项目默认文档为中文，英文文档见上方链接。
+`QuarkPlusPlus` 是一个面向命令行与自动化场景的夸克网盘客户端，使用 `C++23` 构建，配合 `xmake` 提供简洁的构建、运行与安装体验。项目采用 `libcurl + OpenSSL + nlohmann_json` 组织跨平台网络、加密与数据处理能力，默认文档为中文，英文文档见上方链接。
 
 ## 已实现能力
 
@@ -27,7 +25,7 @@
 
 ## 配置
 
-项目默认从 `config/quarkpp.local.json` 读取本地配置。这个文件已被 `.gitignore` 忽略，不会进入仓库。
+项目默认从 `config/quarkpp.local.json` 读取本地配置。
 
 建议直接根据 [config/quarkpp.example.json](config/quarkpp.example.json) 新建本地配置文件，并填入你的 cookie：
 
@@ -45,6 +43,9 @@
 
 - `QUARKPP_CONFIG`
 - `QUARKPP_COOKIE`
+- `NO_COLOR`
+- `QUARKPP_NO_COLOR`
+- `QUARKPP_NO_ICONS`
 
 ## 构建
 
@@ -103,11 +104,6 @@ xmake install -o ./dist
 - 已存在文件的断点续传
 - 目录递归下载
 
-## 编码说明
+## 许可证
 
-已经补了两层 UTF-8 处理：
-
-- 构建时显式使用 UTF-8 源码/执行字符集编译
-- Windows 下命令行参数改为宽字符读取后转 UTF-8，减少中文路径和中文输出乱码问题
-
-如果你后面要在 Linux/macOS 上继续验证，重点就是再做一轮不同终端与不同 locale 下的实机测试。
+本项目使用GPLv3许可证开源

@@ -14,7 +14,3 @@ target("quarkpp")
     add_packages("nlohmann_json", "libcurl", "openssl")
     add_installfiles("config/quarkpp.example.json", {prefixdir = "share/quarkpp/config"})
     add_installfiles("README.md", "README.en.md", "LICENSE", {prefixdir = "share/quarkpp"})
-
-    if is_plat("windows") then
-        add_syslinks("shell32")
-    end

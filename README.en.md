@@ -2,9 +2,7 @@
 
 # QuarkPlusPlus
 
-`QuarkPlusPlus` is a Quark Drive third-party CLI client built with `xmake` and `C++23`.
-
-The current implementation uses `libcurl + OpenSSL + nlohmann_json` and no longer depends on Windows-only networking or crypto APIs such as `WinHTTP / BCrypt / Crypt32`.
+`QuarkPlusPlus` is a Quark Drive CLI client for terminal workflows and automation. It is built with `C++23`, uses `xmake` for a straightforward build/run/install flow, and relies on `libcurl + OpenSSL + nlohmann_json` for cross-platform networking, crypto, and data handling.
 
 ## Features
 
@@ -27,8 +25,7 @@ The current implementation uses `libcurl + OpenSSL + nlohmann_json` and no longe
 
 ## Configuration
 
-By default the project reads local config from `config/quarkpp.local.json`. This file is ignored by `.gitignore`.
-
+By default the project reads local config from `config/quarkpp.local.json`.
 Create it from [config/quarkpp.example.json](config/quarkpp.example.json) and fill in your cookie:
 
 ```json
@@ -45,6 +42,9 @@ Environment overrides are also supported:
 
 - `QUARKPP_CONFIG`
 - `QUARKPP_COOKIE`
+- `NO_COLOR`
+- `QUARKPP_NO_COLOR`
+- `QUARKPP_NO_ICONS`
 
 ## Build
 
@@ -103,9 +103,6 @@ Download flow includes:
 - Resume support for existing files
 - Recursive directory download
 
-## Encoding
+## License
 
-Two UTF-8 fixes are now in place:
-
-- Explicit UTF-8 compiler/input-execution charset settings during build
-- On Windows, command-line arguments are read as wide strings and converted to UTF-8 to reduce issues with non-ASCII paths and output
+This project is open source under the GPLv3 license.
