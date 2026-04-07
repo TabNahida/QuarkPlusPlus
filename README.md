@@ -58,14 +58,14 @@ xmake
 推荐直接使用 `xmake run`，命令写法跨平台一致：
 
 ```sh
-xmake run quarkpp -- --help
-xmake run quarkpp -- account
-xmake run quarkpp -- ls
-xmake run quarkpp -- ls --path /视频
-xmake run quarkpp -- upload ./movie.mkv --to-path /视频 --name movie-final.mkv
-xmake run quarkpp -- download --path /视频 --out ./downloads
-xmake run quarkpp -- share-create --path /视频/电影合集 --expire 7d --passcode 1234
-xmake run quarkpp -- transfer "https://pan.quark.cn/s/xxxx" --passcode 1234 --to-path /收藏
+xmake run quarkpp --help
+xmake run quarkpp account
+xmake run quarkpp ls
+xmake run quarkpp ls --path /视频
+xmake run quarkpp upload ./movie.mkv --to-path /视频 --name movie-final.mkv
+xmake run quarkpp download --path /视频 --out ./downloads
+xmake run quarkpp share-create --path /视频/电影合集 --expire 7d --passcode 1234
+xmake run quarkpp transfer "https://pan.quark.cn/s/xxxx" --passcode 1234 --to-path /收藏
 ```
 
 ## 安装

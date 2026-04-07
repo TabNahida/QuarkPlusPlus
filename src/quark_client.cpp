@@ -136,6 +136,28 @@ void ensure_api_success(const json& result, const std::string& action) {
     return static_cast<int>(std::clamp<std::uint64_t>(gap, 300, 5000));
 }
 
+[[nodiscard]] std::string summarize_http_error(const HttpResponse& response) {
+    if (!response.body.empty()) {
+        try {
+            const auto body = json::parse(response.body);
+            const auto message = body.value("message", "");
+            const auto code = json_string(body, "code");
+            if (!message.empty() || !code.empty()) {
+                std::string summary;
+                if (!code.empty()) {
+                    summary += " code=" + code;
+                }
+                if (!message.empty()) {
+                    summary += " message=" + message;
+                }
+                return trim(summary);
+            }
+        } catch (...) {
+        }
+    }
+    return {};
+}
+
 }  // namespace
 
 QuarkClient::QuarkClient(AppConfig config)
@@ -199,7 +221,9 @@ json QuarkClient::api_get_json(const std::string& url,
     merged_headers.insert(merged_headers.end(), headers.begin(), headers.end());
     auto response = http_.request("GET", url, query, merged_headers);
     if (response.status_code < 200 || response.status_code >= 300) {
-        throw QuarkException("HTTP GET 失败: " + std::to_string(response.status_code));
+        auto detail = summarize_http_error(response);
+        throw QuarkException("HTTP GET 失败: " + std::to_string(response.status_code) +
+                             (detail.empty() ? std::string() : " | " + detail));
     }
     return response.json_body();
 }
@@ -212,7 +236,9 @@ json QuarkClient::api_post_json(const std::string& url,
     merged_headers.insert(merged_headers.end(), headers.begin(), headers.end());
     auto response = http_.request("POST", url, query, merged_headers, body.dump());
     if (response.status_code < 200 || response.status_code >= 300) {
-        throw QuarkException("HTTP POST 失败: " + std::to_string(response.status_code));
+        auto detail = summarize_http_error(response);
+        throw QuarkException("HTTP POST 失败: " + std::to_string(response.status_code) +
+                             (detail.empty() ? std::string() : " | " + detail));
     }
     return response.json_body();
 }
@@ -220,7 +246,11 @@ json QuarkClient::api_post_json(const std::string& url,
 json QuarkClient::account_info() const {
     const auto result = api_get_json(std::string(kPanBase) + "/account/info", {{"platform", "pc"}, {"fr", "pc"}});
     ensure_api_success(result, "读取账号信息");
-    return result.at("data");
+    const auto data = result.value("data", json::object());
+    if (data.is_null() || (data.is_object() && data.empty())) {
+        throw QuarkException("账号接口返回空数据；当前 cookie 很可能未登录、已过期，或不被夸克网盘接口识别");
+    }
+    return data;
 }
 
 json QuarkClient::growth_info() const {

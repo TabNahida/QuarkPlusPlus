@@ -9,6 +9,7 @@
 #include <optional>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #if defined(_WIN32)
@@ -17,6 +18,10 @@
 #endif
 #include <Windows.h>
 #include <shellapi.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#elif defined(__linux__)
+#include <unistd.h>
 #endif
 
 namespace quarkpp {
@@ -24,6 +29,8 @@ namespace quarkpp {
 namespace {
 
 using ArgList = std::vector<std::string>;
+
+[[nodiscard]] std::optional<std::string> getenv_string(const char* name);
 
 #if defined(_WIN32)
 [[nodiscard]] std::string wide_to_utf8(std::wstring_view value) {
@@ -63,6 +70,89 @@ using ArgList = std::vector<std::string>;
 #else
     return std::filesystem::path(std::string(value));
 #endif
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> executable_path() {
+#if defined(_WIN32)
+    std::wstring buffer(MAX_PATH, L'\0');
+    for (;;) {
+        const auto length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0) {
+            return std::nullopt;
+        }
+        if (length < buffer.size()) {
+            buffer.resize(length);
+            return std::filesystem::path(buffer);
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+#elif defined(__APPLE__)
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string buffer(size, '\0');
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+        return std::nullopt;
+    }
+    return std::filesystem::weakly_canonical(std::filesystem::path(buffer.c_str()));
+#elif defined(__linux__)
+    std::vector<char> buffer(1024, '\0');
+    for (;;) {
+        const auto length = readlink("/proc/self/exe", buffer.data(), buffer.size());
+        if (length < 0) {
+            return std::nullopt;
+        }
+        if (static_cast<std::size_t>(length) < buffer.size()) {
+            return std::filesystem::path(std::string(buffer.data(), static_cast<std::size_t>(length)));
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+#else
+    return std::nullopt;
+#endif
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> find_upwards(const std::filesystem::path& start,
+                                                                const std::filesystem::path& relative) {
+    auto current = std::filesystem::weakly_canonical(start);
+    for (;;) {
+        const auto candidate = current / relative;
+        if (std::filesystem::exists(candidate)) {
+            return candidate;
+        }
+        if (current == current.root_path()) {
+            break;
+        }
+        const auto parent = current.parent_path();
+        if (parent == current) {
+            break;
+        }
+        current = parent;
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] std::filesystem::path resolve_config_path(const std::optional<std::string>& explicit_path) {
+    const auto requested = path_from_utf8(explicit_path.value_or(
+        getenv_string("QUARKPP_CONFIG").value_or("config/quarkpp.local.json")));
+    if (requested.is_absolute() || explicit_path || getenv_string("QUARKPP_CONFIG")) {
+        return requested;
+    }
+
+    if (std::filesystem::exists(requested)) {
+        return requested;
+    }
+
+    if (const auto found = find_upwards(std::filesystem::current_path(), requested)) {
+        return *found;
+    }
+
+    if (const auto exe = executable_path()) {
+        if (const auto found = find_upwards(exe->parent_path(), requested)) {
+            return *found;
+        }
+    }
+
+    return requested;
 }
 
 void init_console_encoding() {
@@ -183,8 +273,7 @@ void print_help() {
 
 [[nodiscard]] AppConfig load_config(const std::optional<std::string>& config_path_override) {
     AppConfig config;
-    const auto config_path = path_from_utf8(config_path_override.value_or(
-        getenv_string("QUARKPP_CONFIG").value_or("config/quarkpp.local.json")));
+    const auto config_path = resolve_config_path(config_path_override);
 
     if (std::filesystem::exists(config_path)) {
         std::ifstream input(config_path);

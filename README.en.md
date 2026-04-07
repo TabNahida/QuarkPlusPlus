@@ -58,14 +58,14 @@ xmake
 The recommended cross-platform way to run the client is `xmake run`:
 
 ```sh
-xmake run quarkpp -- --help
-xmake run quarkpp -- account
-xmake run quarkpp -- ls
-xmake run quarkpp -- ls --path /Videos
-xmake run quarkpp -- upload ./movie.mkv --to-path /Videos --name movie-final.mkv
-xmake run quarkpp -- download --path /Videos --out ./downloads
-xmake run quarkpp -- share-create --path /Videos/Collection --expire 7d --passcode 1234
-xmake run quarkpp -- transfer "https://pan.quark.cn/s/xxxx" --passcode 1234 --to-path /Saved
+xmake run quarkpp --help
+xmake run quarkpp account
+xmake run quarkpp ls
+xmake run quarkpp ls --path /Videos
+xmake run quarkpp upload ./movie.mkv --to-path /Videos --name movie-final.mkv
+xmake run quarkpp download --path /Videos --out ./downloads
+xmake run quarkpp share-create --path /Videos/Collection --expire 7d --passcode 1234
+xmake run quarkpp transfer "https://pan.quark.cn/s/xxxx" --passcode 1234 --to-path /Saved
 ```
 
 ## Install
