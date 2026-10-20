@@ -1,0 +1,133 @@
+name: Build, test and release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            platform: windows
+            arch: x64
+            xmake_arch: x64
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x64
+            xmake_arch: x86_64
+          - runner: macos-15-intel
+            platform: macos
+            arch: x64
+            xmake_arch: x86_64
+          - runner: macos-15
+            platform: macos
+            arch: arm64
+            xmake_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: '3.0.9'
+      - name: Configure
+        run: xmake f -m release -a ${{ matrix.xmake_arch }} --tests=y -y
+      - name: Build CLI and library
+        run: xmake -y
+      - name: Run offline integration tests
+        run: xmake test -v
+      - name: Stage installation
+        run: xmake install -o dist
+      - name: Check installed CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ./dist/bin/quarkpp.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./dist/bin/quarkpp.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check installed CLI (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          ./dist/bin/quarkpp --version
+          ./dist/bin/quarkpp --help
+      - name: Check Linux runtime dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          dependencies=$(ldd dist/bin/quarkpp)
+          printf '%s\n' "$dependencies"
+          if grep -E 'not found|libssl|libcrypto' <<< "$dependencies"; then
+            echo 'OpenSSL must be linked statically and all system dependencies must resolve.'
+            exit 1
+          fi
+      - name: Check macOS runtime dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          dependencies=$(otool -L dist/bin/quarkpp)
+          printf '%s\n' "$dependencies"
+          if grep -E '/opt/homebrew|/usr/local|libssl|libcrypto' <<< "$dependencies"; then
+            echo 'The release must not depend on a build-machine package installation.'
+            exit 1
+          fi
+      - name: Package installation
+        env:
+          RELEASE_REF: ${{ github.ref }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: python scripts/package-release.py package --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quarkpp-${{ matrix.platform }}-${{ matrix.arch }}
+          path: build/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: quarkpp-*
+          path: build/release
+          merge-multiple: true
+      - name: Validate archives and collect checksums
+        env:
+          RELEASE_REF: ${{ github.ref }}
+        run: python scripts/package-release.py checksums
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          notes="docs/release-${version}.md"
+          test -f "$notes"
+          gh release create "$RELEASE_TAG" build/release/*.zip build/release/*.tar.gz build/release/SHA256SUMS --verify-tag --title "QuarkPlusPlus ${version}" --notes-file "$notes"

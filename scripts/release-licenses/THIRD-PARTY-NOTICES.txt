@@ -1,0 +1,21 @@
+QuarkPlusPlus binary distributions include the following components:
+
+cpp-httplib 0.34.0
+https://github.com/yhirose/cpp-httplib/tree/v0.34.0
+Copyright (c) 2017 yhirose; MIT License (cpp-httplib.txt).
+QuarkPlusPlus extends the HTTP method allowlist to support WebDAV.
+
+nlohmann/json 3.12.0
+https://github.com/nlohmann/json/tree/v3.12.0
+Copyright (c) 2013-2025 Niels Lohmann; MIT License (nlohmann-json.txt).
+
+OpenSSL 3.6.1
+https://github.com/openssl/openssl/tree/openssl-3.6.1
+Copyright OpenSSL Project Authors and contributors; Apache License 2.0
+(OpenSSL.txt). The original source files retain contributor notices.
+
+Any vendored QR encoder license is distributed alongside these files.
+QuarkPlusPlus itself is licensed under GPL-3.0 (../LICENSE).
+The corresponding QuarkPlusPlus source commit is recorded in BUILD-INFO.json
+at the archive root. Dependency source links above identify the versions
+used by the build.

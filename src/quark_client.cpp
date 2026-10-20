@@ -1,12 +1,17 @@
-#include "quark_client.h"
+#include "quarkpp/client.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <format>
-#include <iostream>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <openssl/evp.h>
 #include <optional>
-#include <regex>
+#include <set>
+
 #include <sstream>
 #include <thread>
 
@@ -16,10 +21,6 @@ namespace quarkpp
 namespace
 {
 
-constexpr std::string_view kApiBase = "https://drive-pc.quark.cn/1/clouddrive";
-constexpr std::string_view kApiBaseAlt = "https://drive.quark.cn/1/clouddrive";
-constexpr std::string_view kPanBase = "https://pan.quark.cn";
-constexpr std::string_view kGrowthBase = "https://drive-m.quark.cn/1/clouddrive";
 constexpr std::string_view kDesktopDownloadUa =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "quark-cloud-drive/2.5.56 Chrome/100.0.4896.160 Electron/18.3.5.12-a038f7b798 Safari/537.36 Channel/pckk_other_ch";
@@ -36,14 +37,12 @@ constexpr std::string_view kOssUserAgent = "aliyun-sdk-js/6.6.1 Chrome 98.0.4758
     {
         return field.get<std::string>();
     }
-    if (field.is_number_integer())
-    {
-        return std::to_string(field.get<long long>());
-    }
     if (field.is_number_unsigned())
     {
         return std::to_string(field.get<unsigned long long>());
     }
+    if (field.is_number_integer())
+        return std::to_string(field.get<long long>());
     return fallback;
 }
 
@@ -65,10 +64,9 @@ constexpr std::string_view kOssUserAgent = "aliyun-sdk-js/6.6.1 Chrome 98.0.4758
     if (field.is_string())
     {
         std::uint64_t parsed = fallback;
-        std::from_chars(field.get_ref<const std::string &>().data(),
-                        field.get_ref<const std::string &>().data() + field.get_ref<const std::string &>().size(),
-                        parsed);
-        return parsed;
+        const auto &text = field.get_ref<const std::string &>();
+        const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), parsed);
+        return ec == std::errc{} && end == text.data() + text.size() ? parsed : fallback;
     }
     return fallback;
 }
@@ -79,10 +77,16 @@ constexpr std::string_view kOssUserAgent = "aliyun-sdk-js/6.6.1 Chrome 98.0.4758
     {
         return value.at("dir").get<bool>();
     }
+    if (value.contains("file") && value.at("file").is_boolean())
+        return !value.at("file").get<bool>();
     if (value.contains("file_type") && value.at("file_type").is_string())
     {
         return value.at("file_type").get<std::string>() == "folder";
     }
+    if (value.contains("dir") && value.at("dir").is_number_integer())
+        return value.at("dir") != 0;
+    if (value.contains("file_type") && value.at("file_type").is_number_integer())
+        return value.at("file_type") == 0;
     return false;
 }
 
@@ -95,20 +99,24 @@ constexpr std::string_view kOssUserAgent = "aliyun-sdk-js/6.6.1 Chrome 98.0.4758
     entry.size = json_u64(value, "size");
     entry.dir = is_directory_entry(value);
     entry.raw = value;
+    if (entry.fid.empty() || entry.name.empty())
+        throw QuarkException("Malformed file entry: missing fid or file_name");
     return entry;
 }
 
 void ensure_api_success(const json &result, const std::string &action)
 {
-    if (result.contains("success") && result.at("success").is_boolean() && result.at("success").get<bool>())
-    {
+    if (!result.is_object())
+        throw QuarkException(action + ": malformed API response");
+    const auto code = json_string(result, "code");
+    const bool explicit_failure =
+        result.contains("success") && result.at("success").is_boolean() && !result.at("success").get<bool>();
+    const bool explicit_success =
+        result.contains("success") && result.at("success").is_boolean() && result.at("success").get<bool>();
+    if (!explicit_failure && (code == "0" || (code.empty() && explicit_success)))
         return;
-    }
-    if (result.value("code", 0) == 0)
-    {
-        return;
-    }
-    throw QuarkException(action + "失败: " + result.value("message", "未知错误"));
+    throw QuarkException(action + ": " + json_string(result, "message", "API did not report success") +
+                         (code.empty() ? "" : " (code " + code + ")"));
 }
 
 [[nodiscard]] int clamp_retry_count(int value)
@@ -158,16 +166,6 @@ void ensure_api_success(const json &result, const std::string &action)
     return "application/octet-stream";
 }
 
-[[nodiscard]] int extract_gap_ms(const json &task_result)
-{
-    if (!task_result.contains("metadata"))
-    {
-        return 1000;
-    }
-    const auto gap = json_u64(task_result.at("metadata"), "tq_gap", 1000);
-    return static_cast<int>(std::clamp<std::uint64_t>(gap, 300, 5000));
-}
-
 [[nodiscard]] std::string summarize_http_error(const HttpResponse &response)
 {
     if (!response.body.empty())
@@ -198,13 +196,209 @@ void ensure_api_success(const json &result, const std::string &action)
     return {};
 }
 
+[[nodiscard]] std::string oss_error_summary(const HttpResponse &response)
+{
+    // OSS error bodies may contain signatures, signed resource names and upload
+    // IDs. Read only the bounded error-code identifier, never return the body.
+    std::string code;
+    const auto begin = response.body.find("<Code>");
+    if (begin != std::string::npos)
+    {
+        const auto end = response.body.find("</Code>", begin + 6);
+        if (end != std::string::npos && end - begin - 6 <= 80)
+            code = response.body.substr(begin + 6, end - begin - 6);
+    }
+    if (code.empty() ||
+        !std::all_of(code.begin(), code.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; }))
+        return "OSS did not return a recognized error code";
+    static const std::unordered_map<std::string, std::string> explanations{
+        {"InvalidArgument", "a request argument is invalid"},
+        {"InvalidRequest", "the request is incompatible with this upload"},
+        {"InvalidPart", "a referenced part is missing or invalid"},
+        {"InvalidPartOrder", "part ordering is invalid"},
+        {"EntityTooLarge", "the request body exceeds the server limit"},
+        {"EntityTooSmall", "the request body is below the server minimum"},
+        {"SignatureDoesNotMatch", "the signed request and transmitted request differ"},
+        {"BadDigest", "the transmitted content does not match its digest"},
+        {"InvalidDigest", "the content digest encoding is invalid"},
+        {"IncompleteBody", "the transmitted body is shorter than Content-Length"},
+        {"InvalidPartNumber", "the part number is invalid"},
+        {"NoSuchUpload", "the multipart upload session is missing or expired"},
+        {"AccessDenied", "object storage rejected the upload authorization"},
+        {"RequestTimeTooSkewed", "the request clock differs from the server clock"},
+        {"MalformedXML", "the completion XML is invalid"}};
+    const auto explanation = explanations.find(code);
+    return "OSS " + code + (explanation == explanations.end() ? "" : ": " + explanation->second);
+}
+
+void validate_name(const std::string &name)
+{
+    if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\") != std::string::npos ||
+        std::any_of(name.begin(), name.end(), [](unsigned char c) { return c < 32; }))
+        throw QuarkException("Invalid file name");
+}
+
+std::filesystem::path local_name(const std::string &name)
+{
+    validate_name(name);
+    const auto path = path_from_utf8(name);
+    if (path.has_root_path() || path.filename() != path)
+        throw QuarkException("Unsafe remote file name");
+#ifdef _WIN32
+    // Windows reserves device names before the first dot, including CON.a.b.
+    const auto stem = to_lower(name.substr(0, name.find('.')));
+    if (name.find_first_of(":*?\"<>|") != std::string::npos || name.back() == '.' || name.back() == ' ' ||
+        stem == "con" || stem == "prn" || stem == "aux" || stem == "nul" ||
+        (stem.size() == 4 && (stem.starts_with("com") || stem.starts_with("lpt")) && stem[3] >= '1' && stem[3] <= '9'))
+        throw QuarkException("Remote name cannot be represented safely on Windows: " + name);
+#endif
+    return path;
+}
+
+void reject_symlink_path(const std::filesystem::path &path)
+{
+    // Never follow an existing local symlink while materializing remote names.
+    auto current = std::filesystem::absolute(path).lexically_normal();
+    while (!current.empty())
+    {
+        std::error_code ec;
+        if (std::filesystem::is_symlink(std::filesystem::symlink_status(current, ec)))
+            throw QuarkException("Refusing to download through a symbolic link: " + path_to_utf8(current));
+        const auto parent = current.parent_path();
+        if (parent == current)
+            break;
+        current = parent;
+    }
+}
+
+HeaderList merge_headers(HeaderList base, const HeaderList &overrides)
+{
+    for (const auto &[key, value] : overrides)
+    {
+        std::erase_if(base, [&](const auto &item) { return to_lower(item.first) == to_lower(key); });
+        base.emplace_back(key, value);
+    }
+    return base;
+}
+
+std::string url_origin(std::string_view url)
+{
+    const auto scheme = url.find("://");
+    if (scheme == std::string_view::npos)
+        throw QuarkException("Download URL must be absolute");
+    const auto end = url.find_first_of("/?#", scheme + 3);
+    auto origin = to_lower(std::string(url.substr(0, end)));
+    if (origin.find('@') != std::string::npos || origin.find_first_of("\r\n\t ") != std::string::npos)
+        throw QuarkException("Download URL contains an invalid authority");
+    return origin;
+}
+
+void validate_download_origin(const std::string &url, const std::string &api_base)
+{
+    const auto origin = url_origin(url);
+    // Configured API gateways can return links on their own origin. Production
+    // cookies otherwise only go to Quark's HTTPS domain, never arbitrary links.
+    if (origin == url_origin(api_base))
+        return;
+    if (!origin.starts_with("https://"))
+        throw QuarkException("Refusing an insecure download URL");
+    auto host = origin.substr(8);
+    if (const auto port = host.find(':'); port != std::string::npos)
+        host.resize(port);
+    if (host != "quark.cn" && !host.ends_with(".quark.cn"))
+        throw QuarkException("Refusing to send account cookies to an unrelated download host");
+}
+
+std::string xml_escape(std::string_view value)
+{
+    std::string result;
+    for (char c : value)
+    {
+        if (c == '&')
+            result += "&amp;";
+        else if (c == '<')
+            result += "&lt;";
+        else if (c == '>')
+            result += "&gt;";
+        else if (c == '\"')
+            result += "&quot;";
+        else
+            result += c;
+    }
+    return result;
+}
+
+// Quark's versioned wg envelope, documented in docs/protocol.md. The 16-byte
+// version key is public protocol material, not an account credential.
+std::string wg_crypt(std::string_view input, const std::string &key, bool encrypt)
+{
+    if (key.size() != 16 || input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max() - 32))
+        throw QuarkException("Invalid wg key or oversized payload");
+    std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)> ctx(EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free);
+    if (!ctx ||
+        EVP_CipherInit_ex(ctx.get(), EVP_aes_128_cbc(), nullptr, reinterpret_cast<const unsigned char *>(key.data()),
+                          reinterpret_cast<const unsigned char *>(key.data()), encrypt ? 1 : 0) != 1)
+        throw QuarkException("Cannot initialize wg encryption");
+    std::string output(input.size() + 32, '\0');
+    int written = 0, tail = 0;
+    if (EVP_CipherUpdate(ctx.get(), reinterpret_cast<unsigned char *>(output.data()), &written,
+                         reinterpret_cast<const unsigned char *>(input.data()), static_cast<int>(input.size())) != 1 ||
+        EVP_CipherFinal_ex(ctx.get(), reinterpret_cast<unsigned char *>(output.data()) + written, &tail) != 1)
+        throw QuarkException("Invalid wg ciphertext or padding; the provider key may have changed");
+    output.resize(static_cast<std::size_t>(written + tail));
+    return output;
+}
+
+std::string wg_encode(const std::string &plain, const AppConfig &config)
+{
+    std::string bytes;
+    bytes += static_cast<char>(config.offline_secure_number >> 8);
+    bytes += static_cast<char>(config.offline_secure_number & 255);
+    bytes += wg_crypt(plain, config.offline_key, true);
+    return base64_encode(bytes);
+}
+
+std::string wg_decode(const std::string &body, const AppConfig &config)
+{
+    const auto input = trim(body);
+    if (input.empty() || input.size() % 4 != 0 || input.size() > 64 * 1024 * 1024)
+        throw QuarkException("Invalid wg response envelope");
+    std::string bytes(input.size() / 4 * 3, '\0');
+    int count = EVP_DecodeBlock(reinterpret_cast<unsigned char *>(bytes.data()),
+                                reinterpret_cast<const unsigned char *>(input.data()), static_cast<int>(input.size()));
+    if (count < 0)
+        throw QuarkException("Invalid wg base64");
+    if (input.back() == '=')
+        --count;
+    if (input.size() >= 2 && input[input.size() - 2] == '=')
+        --count;
+    if (count < 18)
+        throw QuarkException("Truncated wg response");
+    bytes.resize(static_cast<std::size_t>(count));
+    const auto number = static_cast<unsigned char>(bytes[0]) * 256 + static_cast<unsigned char>(bytes[1]);
+    if (number != config.offline_secure_number)
+        throw QuarkException("Unknown wg response version: " + std::to_string(number));
+    return wg_crypt(std::string_view(bytes).substr(2), config.offline_key, false);
+}
+
 } // namespace
 
-QuarkClient::QuarkClient(AppConfig config) : config_(std::move(config)), http_(config_.request_timeout_ms)
+struct QuarkClient::SessionState
+{
+    explicit SessionState(std::string initial) : cookie(std::move(initial))
+    {
+    }
+    std::mutex mutex;
+    std::string cookie;
+};
+
+QuarkClient::QuarkClient(AppConfig config)
+    : config_(std::move(config)), http_(config_.request_timeout_ms, config_.ca_bundle),
+      session_(std::make_shared<SessionState>(config_.cookie))
 {
     if (config_.cookie.empty())
     {
-        throw QuarkException("缺少夸克 cookie，请在本地配置文件或 QUARKPP_COOKIE 中提供");
+        throw QuarkException("Missing Quark cookie; supply AppConfig.cookie or QUARKPP_COOKIE");
     }
     if (config_.user_agent.empty())
     {
@@ -212,11 +406,71 @@ QuarkClient::QuarkClient(AppConfig config) : config_(std::move(config)), http_(c
                              "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
     }
     config_.upload_retry_count = clamp_retry_count(config_.upload_retry_count);
+    config_.download_retry_count = clamp_retry_count(config_.download_retry_count);
+    if (config_.task_poll_limit == 0)
+        throw QuarkException("task_poll_limit must be positive");
+    while (config_.api_base.ends_with('/'))
+        config_.api_base.pop_back();
+    while (config_.offline_api_base.ends_with('/'))
+        config_.offline_api_base.pop_back();
+    if (config_.cookie.find_first_of("\r\n") != std::string::npos ||
+        config_.user_agent.find_first_of("\r\n") != std::string::npos)
+        throw QuarkException("HTTP credentials and User-Agent must not contain line breaks");
 }
 
 const AppConfig &QuarkClient::config() const
 {
     return config_;
+}
+
+std::string QuarkClient::session_cookie() const
+{
+    std::lock_guard lock(session_->mutex);
+    return session_->cookie;
+}
+
+void QuarkClient::refresh_session_cookie(const HttpResponse &response) const
+{
+    // Only the configured API endpoints may refresh this account credential.
+    // Redirect targets and object-storage responses are not cookie authorities.
+    if (!response.url.starts_with(config_.api_base + "/") && !response.url.starts_with(config_.offline_api_base + "/"))
+        return;
+    for (const auto &field : response.set_cookies)
+    {
+        const auto pair = trim(std::string_view(field).substr(0, field.find(';')));
+        const auto equals = pair.find('=');
+        if (equals == std::string::npos || trim(std::string_view(pair).substr(0, equals)) != "__puus")
+            continue;
+        const auto value = pair.substr(equals + 1);
+        if (value.size() > 16384 || std::any_of(value.begin(), value.end(), [](unsigned char ch)
+                                                { return ch < 0x21 || ch > 0x7e || ch == ';' || ch == ','; }))
+            continue;
+        std::lock_guard lock(session_->mutex);
+        std::string updated;
+        std::size_t begin = 0;
+        while (begin < session_->cookie.size())
+        {
+            const auto end = session_->cookie.find(';', begin);
+            const auto existing = trim(std::string_view(session_->cookie).substr(begin, end - begin));
+            const auto split = existing.find('=');
+            if (!existing.empty() && trim(std::string_view(existing).substr(0, split)) != "__puus")
+            {
+                if (!updated.empty())
+                    updated += "; ";
+                updated += existing;
+            }
+            if (end == std::string::npos)
+                break;
+            begin = end + 1;
+        }
+        if (!value.empty())
+        {
+            if (!updated.empty())
+                updated += "; ";
+            updated += "__puus=" + value;
+        }
+        session_->cookie = std::move(updated);
+    }
 }
 
 QueryList QuarkClient::base_params() const
@@ -227,7 +481,7 @@ QueryList QuarkClient::base_params() const
 HeaderList QuarkClient::api_headers() const
 {
     return {
-        {"Cookie", config_.cookie},
+        {"Cookie", session_cookie()},
         {"Accept", "application/json, text/plain, */*"},
         {"Accept-Language", "zh-CN,zh;q=0.9"},
         {"Content-Type", "application/json"},
@@ -238,146 +492,121 @@ HeaderList QuarkClient::api_headers() const
     };
 }
 
-HeaderList QuarkClient::download_api_headers(bool desktop_ua) const
-{
-    auto headers = api_headers();
-    for (auto &[key, value] : headers)
-    {
-        if (to_lower(key) == "user-agent")
-        {
-            value = desktop_ua ? std::string(kDesktopDownloadUa) : config_.user_agent;
-        }
-    }
-    headers.emplace_back("Accept", "application/json, text/plain, */*");
-    return headers;
-}
-
-HeaderList QuarkClient::file_download_headers() const
+HeaderList QuarkClient::download_headers() const
 {
     return {
-        {"Cookie", config_.cookie},
+        {"Cookie", session_cookie()},
         {"Origin", "https://pan.quark.cn"},
         {"Referer", "https://pan.quark.cn/"},
-        {"User-Agent", config_.user_agent},
+        {"User-Agent", std::string(kDesktopDownloadUa)},
     };
 }
 
 json QuarkClient::api_get_json(const std::string &url, const QueryList &query, const HeaderList &headers) const
 {
-    auto merged_headers = api_headers();
-    merged_headers.insert(merged_headers.end(), headers.begin(), headers.end());
+    auto merged_headers = merge_headers(api_headers(), headers);
     auto response = http_.request("GET", url, query, merged_headers);
+    refresh_session_cookie(response);
     if (response.status_code < 200 || response.status_code >= 300)
     {
         auto detail = summarize_http_error(response);
-        throw QuarkException("HTTP GET 失败: " + std::to_string(response.status_code) +
+        throw QuarkException("HTTP GET failed: " + std::to_string(response.status_code) +
                              (detail.empty() ? std::string() : " | " + detail));
     }
-    return response.json_body();
+    auto result = response.json_body();
+    ensure_api_success(result, "GET API");
+    return result;
 }
 
 json QuarkClient::api_post_json(const std::string &url, const json &body, const QueryList &query,
                                 const HeaderList &headers) const
 {
-    auto merged_headers = api_headers();
-    merged_headers.insert(merged_headers.end(), headers.begin(), headers.end());
+    auto merged_headers = merge_headers(api_headers(), headers);
     auto response = http_.request("POST", url, query, merged_headers, body.dump());
+    refresh_session_cookie(response);
     if (response.status_code < 200 || response.status_code >= 300)
     {
         auto detail = summarize_http_error(response);
-        throw QuarkException("HTTP POST 失败: " + std::to_string(response.status_code) +
+        throw QuarkException("HTTP POST failed: " + std::to_string(response.status_code) +
                              (detail.empty() ? std::string() : " | " + detail));
     }
-    return response.json_body();
+    auto result = response.json_body();
+    ensure_api_success(result, "POST API");
+    return result;
 }
 
 json QuarkClient::account_info() const
 {
-    const auto result = api_get_json(std::string(kPanBase) + "/account/info", {{"platform", "pc"}, {"fr", "pc"}});
-    ensure_api_success(result, "读取账号信息");
+    const auto result = api_get_json(config_.api_base + "/member", base_params());
+    ensure_api_success(result, "Read account information");
     const auto data = result.value("data", json::object());
     if (data.is_null() || (data.is_object() && data.empty()))
     {
-        throw QuarkException("账号接口返回空数据；当前 cookie 很可能未登录、已过期，或不被夸克网盘接口识别");
+        throw QuarkException("Account API returned no data; the cookie may have expired");
     }
     return data;
 }
 
-json QuarkClient::growth_info() const
-{
-    const auto result = api_get_json(std::string(kGrowthBase) + "/capacity/growth/info", base_params());
-    ensure_api_success(result, "读取容量签到信息");
-    return result.at("data");
-}
-
-json QuarkClient::growth_sign() const
-{
-    const auto result =
-        api_post_json(std::string(kGrowthBase) + "/capacity/growth/sign", json::object(), base_params());
-    ensure_api_success(result, "容量签到");
-    return result.at("data");
-}
-
-std::vector<RemoteEntry> QuarkClient::list_directory(const std::string &pdir_fid) const
+std::vector<RemoteEntry> QuarkClient::list_entries(const std::string &endpoint, const QueryList &extra) const
 {
     std::vector<RemoteEntry> entries;
-    constexpr int page_size = 100;
-    int page = 1;
-
-    for (;;)
+    std::unordered_set<std::string> seen;
+    constexpr unsigned page_size = 100;
+    for (unsigned page = 1; page <= 100000; ++page)
     {
         auto query = base_params();
-        query.emplace_back("pdir_fid", pdir_fid);
+        query.insert(query.end(), extra.begin(), extra.end());
         query.emplace_back("_page", std::to_string(page));
         query.emplace_back("_size", std::to_string(page_size));
         query.emplace_back("_fetch_total", "1");
         query.emplace_back("_fetch_sub_dirs", "0");
         query.emplace_back("_sort", "file_type:asc,file_name:asc");
-
-        const auto result = api_get_json(std::string(kApiBase) + "/file/sort", query);
-        ensure_api_success(result, "列目录");
-
-        const auto list = result.at("data").at("list");
+        const auto result = api_get_json(config_.api_base + endpoint, query);
+        const auto &list = result.at("data").at("list");
+        if (!list.is_array())
+            throw QuarkException("Listing did not return an array");
+        const auto previous_size = entries.size();
         for (const auto &item : list)
         {
-            entries.push_back(make_remote_entry(item));
+            auto entry = make_remote_entry(item);
+            if (seen.insert(entry.fid).second)
+                entries.push_back(std::move(entry));
         }
-
         const auto metadata = result.value("metadata", json::object());
-        const auto total = json_u64(metadata, "_total", static_cast<std::uint64_t>(entries.size()));
-        if (list.empty() || entries.size() >= total || list.size() < page_size)
+        const auto total = json_u64(metadata, "_total", std::numeric_limits<std::uint64_t>::max());
+        if (entries.size() >= total || (list.size() < page_size && !metadata.contains("_total")))
+            return entries;
+        if (list.empty())
         {
-            break;
+            if (metadata.contains("_total") && entries.size() < total)
+                throw QuarkException("Directory changed during pagination; retry listing");
+            return entries;
         }
-        ++page;
+        if (entries.size() == previous_size)
+            throw QuarkException("Server repeated a listing page; refusing incomplete results");
     }
-    return entries;
+    throw QuarkException("Listing exceeded the pagination limit");
+}
+
+std::vector<RemoteEntry> QuarkClient::list_directory(const std::string &pdir_fid) const
+{
+    return list_entries("/file/sort", {{"pdir_fid", pdir_fid}});
 }
 
 std::vector<RemoteEntry> QuarkClient::search(const std::string &keyword, const std::string &pdir_fid) const
 {
-    auto query = base_params();
-    query.emplace_back("pdir_fid", pdir_fid);
-    query.emplace_back("query", keyword);
-
-    const auto result = api_get_json(std::string(kApiBase) + "/file/search", query);
-    ensure_api_success(result, "搜索文件");
-
-    std::vector<RemoteEntry> entries;
-    for (const auto &item : result.at("data").at("list"))
-    {
-        entries.push_back(make_remote_entry(item));
-    }
-    return entries;
+    return list_entries("/file/search", {{"pdir_fid", pdir_fid}, {"q", keyword}});
 }
 
 RemoteEntry QuarkClient::file_info(const std::string &fid) const
 {
+    if (fid == "0")
+        return RemoteEntry{"0", "/", "", 0, true, json::object()};
     auto query = base_params();
     query.emplace_back("fid", fid);
 
-    const auto result = api_get_json(std::string(kApiBase) + "/file/info", query);
-    ensure_api_success(result, "读取文件信息");
+    const auto result = api_get_json(config_.api_base + "/file/info", query);
+    ensure_api_success(result, "Read file information");
     return make_remote_entry(result.at("data"));
 }
 
@@ -392,12 +621,16 @@ RemoteEntry QuarkClient::resolve_path(const std::string &remote_path) const
         RemoteEntry{.fid = "0", .name = "/", .parent_fid = "", .size = 0, .dir = true, .raw = json::object()};
     for (const auto &segment : split_remote_path(remote_path))
     {
+        if (segment == "." || segment == "..")
+            throw QuarkException("Remote paths cannot contain dot segments");
+        if (!current.dir)
+            throw QuarkException("A remote path component is not a directory");
         auto children = list_directory(current.fid);
         const auto it = std::find_if(children.begin(), children.end(),
                                      [&](const RemoteEntry &entry) { return entry.name == segment; });
         if (it == children.end())
         {
-            throw QuarkException("远端路径不存在: " + remote_path);
+            throw QuarkException("Remote path does not exist: " + remote_path);
         }
         current = *it;
     }
@@ -406,6 +639,7 @@ RemoteEntry QuarkClient::resolve_path(const std::string &remote_path) const
 
 json QuarkClient::create_folder(const std::string &pdir_fid, const std::string &name) const
 {
+    validate_name(name);
     json body{
         {"pdir_fid", pdir_fid},
         {"file_name", name},
@@ -413,280 +647,50 @@ json QuarkClient::create_folder(const std::string &pdir_fid, const std::string &
         {"dir_init_lock", false},
     };
 
-    const auto result = api_post_json(std::string(kApiBase) + "/file", body, base_params());
-    ensure_api_success(result, "创建文件夹");
+    const auto result = api_post_json(config_.api_base + "/file", body, base_params());
+    ensure_api_success(result, "Create folder");
     return result.at("data");
 }
 
 json QuarkClient::rename(const std::string &fid, const std::string &new_name) const
 {
+    validate_name(new_name);
+    if (fid.empty() || fid == "0")
+        throw QuarkException("Cannot rename the root directory");
     json body{
         {"fid", fid},
         {"file_name", new_name},
     };
-    const auto result = api_post_json(std::string(kApiBase) + "/file/rename", body, base_params());
-    ensure_api_success(result, "重命名");
+    const auto result = api_post_json(config_.api_base + "/file/rename", body, base_params());
+    ensure_api_success(result, "Rename");
     return result.at("data");
 }
 
 json QuarkClient::delete_items(const std::vector<std::string> &fids) const
 {
+    if (fids.empty() || std::find(fids.begin(), fids.end(), "0") != fids.end() ||
+        std::find(fids.begin(), fids.end(), "") != fids.end())
+        throw QuarkException("Invalid file selection");
     json body{
-        {"action_type", 2},
+        {"action_type", 1},
         {"exclude_fids", json::array()},
         {"filelist", fids},
     };
-    const auto result = api_post_json(std::string(kApiBase) + "/file/delete", body, base_params());
-    ensure_api_success(result, "删除文件");
+    const auto result = api_post_json(config_.api_base + "/file/delete", body, base_params());
+    ensure_api_success(result, "Delete files");
     return result.value("data", json::object());
 }
 
-json QuarkClient::poll_task(const std::string &task_id, int max_retries) const
+json QuarkClient::move_items(const std::vector<std::string> &fids, const std::string &parent_fid) const
 {
-    for (int index = 0; index < max_retries; ++index)
-    {
-        auto query = base_params();
-        query.emplace_back("task_id", task_id);
-        query.emplace_back("retry_index", std::to_string(index));
-        query.emplace_back("__dt", std::to_string(unix_time_milliseconds_now() % 1000));
-        query.emplace_back("__t", std::to_string(unix_time_milliseconds_now()));
-
-        const auto result = api_get_json(std::string(kApiBase) + "/task", query);
-        ensure_api_success(result, "轮询任务");
-
-        const auto &data = result.at("data");
-        const auto status = json_u64(data, "status", 0);
-        if (status == 2)
-        {
-            return data;
-        }
-        if (status == 3)
-        {
-            throw QuarkException("任务失败: " + json_string(data, "message", result.value("message", "未知错误")));
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(extract_gap_ms(result)));
-    }
-
-    throw QuarkException("任务轮询超时: " + task_id);
-}
-
-QuarkClient::ParsedShare QuarkClient::parse_share_url(const std::string &share_url,
-                                                      const std::optional<std::string> &passcode) const
-{
-    static const std::regex pattern(R"(/s/([A-Za-z0-9]+)(?:#/list/share[^/]*/([A-Za-z0-9]+))?)");
-    static const std::regex passcode_pattern(R"((?:pwd=|提取码[:：])([A-Za-z0-9]+))");
-
-    std::smatch match;
-    if (!std::regex_search(share_url, match, pattern))
-    {
-        throw QuarkException("无效的分享链接");
-    }
-
-    ParsedShare parsed;
-    parsed.pwd_id = match[1].str();
-    if (match.size() >= 3 && match[2].matched)
-    {
-        parsed.share_fid = match[2].str();
-    }
-
-    if (passcode && !passcode->empty())
-    {
-        parsed.passcode = passcode;
-        return parsed;
-    }
-
-    std::smatch passcode_match;
-    if (std::regex_search(share_url, passcode_match, passcode_pattern))
-    {
-        parsed.passcode = passcode_match[1].str();
-    }
-    return parsed;
-}
-
-std::string QuarkClient::get_share_token(const std::string &pwd_id, const std::optional<std::string> &passcode) const
-{
-    auto query = base_params();
-    query.emplace_back("__dt", std::to_string(unix_time_milliseconds_now() % 1000));
-    query.emplace_back("__t", std::to_string(unix_time_milliseconds_now()));
-
-    json body{
-        {"pwd_id", pwd_id},
-        {"passcode", passcode.value_or("")},
-    };
-
-    const auto result = api_post_json(std::string(kApiBase) + "/share/sharepage/token", body, query);
-    ensure_api_success(result, "获取分享 token");
-
-    if (!result.contains("data") || !result.at("data").contains("stoken"))
-    {
-        throw QuarkException("分享 token 响应缺少 stoken");
-    }
-    return result.at("data").at("stoken").get<std::string>();
-}
-
-json QuarkClient::get_share_detail(const std::string &pwd_id, const std::string &stoken,
-                                   const std::string &pdir_fid) const
-{
-    json combined{
-        {"share", json::object()},
-        {"list", json::array()},
-    };
-
-    constexpr int page_size = 50;
-    int page = 1;
-    for (;;)
-    {
-        auto query = base_params();
-        query.emplace_back("pwd_id", pwd_id);
-        query.emplace_back("stoken", stoken);
-        query.emplace_back("pdir_fid", pdir_fid);
-        query.emplace_back("force", "0");
-        query.emplace_back("_page", std::to_string(page));
-        query.emplace_back("_size", std::to_string(page_size));
-        query.emplace_back("_fetch_total", "1");
-        query.emplace_back("_sort", "file_type:asc,updated_at:desc");
-
-        const auto result = api_get_json(std::string(kApiBase) + "/share/sharepage/detail", query);
-        ensure_api_success(result, "读取分享详情");
-
-        if (combined.at("share").empty() && result.at("data").contains("share"))
-        {
-            combined["share"] = result.at("data").at("share");
-        }
-
-        const auto &list = result.at("data").at("list");
-        for (const auto &item : list)
-        {
-            combined["list"].push_back(item);
-        }
-
-        const auto metadata = result.value("metadata", json::object());
-        const auto total = json_u64(metadata, "_total", combined.at("list").size());
-        if (list.empty() || combined.at("list").size() >= total || list.size() < page_size)
-        {
-            break;
-        }
-        ++page;
-    }
-
-    return combined;
-}
-
-json QuarkClient::share_create(const std::vector<std::string> &fids, const std::string &title, int expired_type,
-                               int url_type, const std::optional<std::string> &passcode) const
-{
-    auto query = base_params();
-    query.emplace_back("__dt", std::to_string(unix_time_milliseconds_now() % 1000));
-    query.emplace_back("__t", std::to_string(unix_time_milliseconds_now()));
-
-    json body{
-        {"fid_list", fids},
-        {"title", title},
-        {"expired_type", expired_type},
-        {"url_type", url_type},
-    };
-    if (passcode && !passcode->empty())
-    {
-        body["passcode"] = *passcode;
-    }
-
-    const auto result = api_post_json(std::string(kApiBase) + "/share", body, query);
-    ensure_api_success(result, "创建分享");
-
-    const auto task_id = json_string(result.at("data"), "task_id");
-    if (task_id.empty())
-    {
-        throw QuarkException("分享任务未返回 task_id");
-    }
-
-    auto task = poll_task(task_id);
-    const auto share_id = json_string(task, "share_id");
-    if (share_id.empty())
-    {
-        throw QuarkException("分享任务完成后未返回 share_id");
-    }
-
-    const auto password_info =
-        api_post_json(std::string(kApiBase) + "/share/password", json{{"share_id", share_id}}, base_params());
-    ensure_api_success(password_info, "获取分享链接");
-
-    json output = password_info.at("data");
-    output["share_id"] = share_id;
-    output["title"] = title;
-    if (!output.contains("share_url") && output.contains("pwd_id"))
-    {
-        output["share_url"] = std::string("https://pan.quark.cn/s/") + output.at("pwd_id").get<std::string>();
-    }
-    return output;
-}
-
-json QuarkClient::share_list(int page, int size) const
-{
-    auto query = base_params();
-    query.emplace_back("_page", std::to_string(page));
-    query.emplace_back("_size", std::to_string(size));
-    query.emplace_back("_order_field", "created_at");
-    query.emplace_back("_order_type", "desc");
-    query.emplace_back("_fetch_total", "1");
-    query.emplace_back("_fetch_notify_follow", "1");
-
-    const auto result = api_get_json(std::string(kApiBase) + "/share/mypage/detail", query);
-    ensure_api_success(result, "读取分享列表");
-    return result;
-}
-
-json QuarkClient::transfer_share(const std::string &share_url, const std::string &to_pdir_fid,
-                                 const std::optional<std::string> &passcode) const
-{
-    const auto parsed = parse_share_url(share_url, passcode);
-    const auto stoken = get_share_token(parsed.pwd_id, parsed.passcode);
-    const auto detail = get_share_detail(parsed.pwd_id, stoken, parsed.share_fid);
-
-    std::vector<std::string> fid_list;
-    std::vector<std::string> fid_token_list;
-    for (const auto &item : detail.at("list"))
-    {
-        const auto fid = json_string(item, "fid");
-        const auto token = json_string(item, "share_fid_token");
-        if (!fid.empty() && !token.empty())
-        {
-            fid_list.push_back(fid);
-            fid_token_list.push_back(token);
-        }
-    }
-
-    if (fid_list.empty() || fid_list.size() != fid_token_list.size())
-    {
-        throw QuarkException("无法从分享详情中提取 fid 与 share_fid_token");
-    }
-
-    auto query = base_params();
-    query.emplace_back("__dt", std::to_string(unix_time_milliseconds_now() % 1000));
-    query.emplace_back("__t", std::to_string(unix_time_milliseconds_now()));
-
-    json body{
-        {"fid_list", fid_list},
-        {"fid_token_list", fid_token_list},
-        {"to_pdir_fid", to_pdir_fid},
-        {"pwd_id", parsed.pwd_id},
-        {"stoken", stoken},
-        {"pdir_fid", parsed.share_fid},
-        {"scene", "link"},
-    };
-
-    auto result = api_post_json(std::string(kApiBase) + "/share/sharepage/save", body, query);
-    if (result.value("code", 0) != 0)
-    {
-        result = api_post_json(std::string(kApiBaseAlt) + "/share/sharepage/save", body, query);
-    }
-    ensure_api_success(result, "转存分享");
-
-    const auto task_id = json_string(result.at("data"), "task_id");
-    if (task_id.empty())
-    {
-        throw QuarkException("转存任务未返回 task_id");
-    }
-    return poll_task(task_id);
+    if (fids.empty() || std::find(fids.begin(), fids.end(), "0") != fids.end() ||
+        std::find(fids.begin(), fids.end(), "") != fids.end())
+        throw QuarkException("Invalid file selection");
+    const auto result = api_post_json(
+        config_.api_base + "/file/move",
+        {{"action_type", 1}, {"exclude_fids", json::array()}, {"filelist", fids}, {"to_pdir_fid", parent_fid}},
+        base_params());
+    return result.value("data", json::object());
 }
 
 QuarkClient::UploadPreflight QuarkClient::prepare_upload(const std::filesystem::path &local_path,
@@ -695,7 +699,6 @@ QuarkClient::UploadPreflight QuarkClient::prepare_upload(const std::filesystem::
 {
     json body{
         {"ccp_hash_update", true},
-        {"parallel_upload", true},
         {"pdir_fid", pdir_fid},
         {"dir_name", ""},
         {"file_name", file_name},
@@ -705,8 +708,8 @@ QuarkClient::UploadPreflight QuarkClient::prepare_upload(const std::filesystem::
         {"size", std::filesystem::file_size(local_path)},
     };
 
-    const auto result = api_post_json(std::string(kApiBase) + "/file/upload/pre", body, base_params());
-    ensure_api_success(result, "预上传");
+    const auto result = api_post_json(config_.api_base + "/file/upload/pre", body, base_params());
+    ensure_api_success(result, "Upload preflight");
 
     UploadPreflight preflight;
     preflight.task_id = json_string(result.at("data"), "task_id");
@@ -717,13 +720,11 @@ QuarkClient::UploadPreflight QuarkClient::prepare_upload(const std::filesystem::
     preflight.upload_id = json_string(result.at("data"), "upload_id");
     preflight.auth_info = json_string(result.at("data"), "auth_info");
     preflight.callback = result.at("data").value("callback", json::object());
-    preflight.part_size = json_u64(result.at("metadata"), "part_size", 16ULL * 1024ULL * 1024ULL);
-    preflight.raw = result;
+    preflight.part_size = json_u64(result.value("metadata", json::object()), "part_size", 16ULL * 1024ULL * 1024ULL);
 
-    if (preflight.task_id.empty() || preflight.obj_key.empty() || preflight.bucket.empty() ||
-        preflight.upload_url.empty())
+    if (preflight.task_id.empty())
     {
-        throw QuarkException("预上传响应缺少关键字段");
+        throw QuarkException("Upload preflight is missing task_id");
     }
     return preflight;
 }
@@ -736,31 +737,40 @@ json QuarkClient::check_fast_upload(const UploadPreflight &preflight, const Hash
         {"sha1", digests.sha1_hex},
     };
 
-    const auto result = api_post_json(std::string(kApiBase) + "/file/update/hash", body, base_params());
-    ensure_api_success(result, "秒传检查");
+    const auto result = api_post_json(config_.api_base + "/file/update/hash", body, base_params());
+    ensure_api_success(result, "Fast upload check");
     return result.value("data", json::object());
 }
 
 std::string QuarkClient::get_upload_auth(const UploadPreflight &preflight, const std::string &auth_meta) const
 {
-    const auto result = api_post_json(std::string(kApiBase) + "/file/upload/auth",
+    const auto result = api_post_json(config_.api_base + "/file/upload/auth",
                                       json{
                                           {"auth_info", preflight.auth_info},
                                           {"auth_meta", auth_meta},
                                           {"task_id", preflight.task_id},
                                       },
                                       base_params());
-    ensure_api_success(result, "获取上传授权");
+    ensure_api_success(result, "Get upload authorization");
     const auto auth_key = json_string(result.at("data"), "auth_key");
     if (auth_key.empty())
     {
-        throw QuarkException("上传授权响应缺少 auth_key");
+        throw QuarkException("Upload authorization response is missing auth_key");
     }
     return auth_key;
 }
 
 std::string QuarkClient::make_oss_object_url(const UploadPreflight &preflight) const
 {
+    std::string object_path;
+    for (const auto &segment : split_remote_path(preflight.obj_key))
+    {
+        if (!object_path.empty())
+            object_path += '/';
+        object_path += url_encode(segment);
+    }
+    if (!config_.upload_base.empty())
+        return config_.upload_base + "/" + object_path;
     std::string suffix = preflight.upload_url;
     if (suffix.starts_with("https://"))
     {
@@ -770,7 +780,9 @@ std::string QuarkClient::make_oss_object_url(const UploadPreflight &preflight) c
     {
         suffix.erase(0, 7);
     }
-    return std::format("https://{}.{}/{}", preflight.bucket, suffix, preflight.obj_key);
+    while (suffix.ends_with('/'))
+        suffix.pop_back();
+    return std::format("https://{}.{}/{}", preflight.bucket, suffix, object_path);
 }
 
 std::string QuarkClient::upload_part(const UploadPreflight &preflight, const std::filesystem::path &file_path,
@@ -798,13 +810,15 @@ std::string QuarkClient::upload_part(const UploadPreflight &preflight, const std
                                 headers, file_path, offset, length, progress);
     if (response.status_code < 200 || response.status_code >= 300)
     {
-        throw QuarkException("分片上传失败，HTTP 状态码: " + std::to_string(response.status_code));
+        throw QuarkException("Part upload failed, HTTP " + std::to_string(response.status_code) +
+                             ", part=" + std::to_string(part_number) + ", bytes=" + std::to_string(length) + "; " +
+                             oss_error_summary(response));
     }
 
     auto etag = response.header("etag");
     if (etag.empty())
     {
-        throw QuarkException("分片上传成功但响应中没有 ETag");
+        throw QuarkException("Part upload response is missing ETag");
     }
     return etag;
 }
@@ -816,7 +830,8 @@ void QuarkClient::complete_upload(const UploadPreflight &preflight, const std::v
         << "<CompleteMultipartUpload>";
     for (std::size_t index = 0; index < etags.size(); ++index)
     {
-        xml << "<Part><PartNumber>" << (index + 1) << "</PartNumber><ETag>" << etags[index] << "</ETag></Part>";
+        xml << "<Part><PartNumber>" << (index + 1) << "</PartNumber><ETag>" << xml_escape(etags[index])
+            << "</ETag></Part>";
     }
     xml << "</CompleteMultipartUpload>";
 
@@ -856,8 +871,20 @@ void QuarkClient::complete_upload(const UploadPreflight &preflight, const std::v
         http_.request("POST", make_oss_object_url(preflight), {{"uploadId", preflight.upload_id}}, headers, xml_body);
     if (response.status_code < 200 || response.status_code >= 300)
     {
-        throw QuarkException("合并上传分片失败，HTTP 状态码: " + std::to_string(response.status_code));
+        throw QuarkException("Multipart completion failed, HTTP " + std::to_string(response.status_code) + "; " +
+                             oss_error_summary(response));
     }
+    for (auto position = response.body.find("<Error"); position != std::string::npos;
+         position = response.body.find("<Error", position + 6))
+    {
+        const auto next = position + 6;
+        if (next < response.body.size() && (response.body[next] == '>' || response.body[next] == '/' ||
+                                            std::isspace(static_cast<unsigned char>(response.body[next]))))
+            throw QuarkException("Object storage rejected multipart completion");
+    }
+    const auto callback_result = json::parse(response.body, nullptr, false);
+    if (callback_result.is_object() && (callback_result.contains("code") || callback_result.contains("success")))
+        ensure_api_success(callback_result, "Object storage completion callback");
 }
 
 json QuarkClient::finish_upload(const UploadPreflight &preflight) const
@@ -869,97 +896,27 @@ json QuarkClient::finish_upload(const UploadPreflight &preflight) const
 
     for (int attempt = 0; attempt < 5; ++attempt)
     {
-        const auto result = api_post_json(std::string(kApiBase) + "/file/upload/finish", body, base_params());
-        ensure_api_success(result, "通知服务器完成上传");
+        const auto result = api_post_json(config_.api_base + "/file/upload/finish", body, base_params());
+        ensure_api_success(result, "Finish upload");
         const auto data = result.value("data", json::object());
-        if (data.value("finish", false))
+        if (!data.is_object())
+            throw QuarkException("Upload finish returned malformed data");
+        if (data.contains("finish") && !data.at("finish").is_boolean())
+            throw QuarkException("Upload finish returned a non-boolean confirmation");
+        if ((data.contains("finish") && data.at("finish").get<bool>()) ||
+            (!data.contains("finish") && !json_string(data, "fid").empty()))
         {
             return data;
         }
+        if (!data.contains("finish"))
+            throw QuarkException("Upload finish returned no completion confirmation or file ID");
         std::this_thread::sleep_for(std::chrono::seconds(1 + attempt));
     }
-    throw QuarkException("服务器未确认上传完成");
+    throw QuarkException("Server did not confirm upload completion");
 }
 
-UploadResult QuarkClient::upload_file(const std::filesystem::path &local_path, const std::string &pdir_fid,
-                                      const std::optional<std::string> &new_name) const
-{
-    if (!std::filesystem::exists(local_path) || !std::filesystem::is_regular_file(local_path))
-    {
-        throw QuarkException("本地文件不存在: " + path_to_utf8(local_path));
-    }
-
-    const auto file_name = new_name.value_or(path_to_utf8(local_path.filename()));
-    const auto file_size = std::filesystem::file_size(local_path);
-    const auto mime_type = detect_mime_type(local_path);
-    const auto digests = compute_file_hashes(local_path);
-    const auto preflight = prepare_upload(local_path, pdir_fid, file_name);
-    const auto fast_upload = check_fast_upload(preflight, digests);
-
-    if (fast_upload.value("finish", false))
-    {
-        const auto finished = finish_upload(preflight);
-        return UploadResult{
-            .fid = json_string(finished, "fid", preflight.fid),
-            .file_name = file_name,
-            .size = file_size,
-            .fast_upload = true,
-        };
-    }
-
-    std::vector<std::string> etags;
-    ProgressBar progress_bar("upload " + file_name);
-
-    std::uint64_t uploaded = 0;
-    const auto part_size = preflight.part_size == 0 ? 16ULL * 1024ULL * 1024ULL : preflight.part_size;
-    const auto part_count = (file_size + part_size - 1) / part_size;
-
-    for (std::uint64_t part = 0; part < part_count; ++part)
-    {
-        const auto offset = part * part_size;
-        const auto length = std::min<std::uint64_t>(part_size, file_size - offset);
-
-        std::exception_ptr last_error;
-        for (int attempt = 0; attempt < config_.upload_retry_count; ++attempt)
-        {
-            try
-            {
-                const auto etag = upload_part(
-                    preflight, local_path, mime_type, offset, length, part + 1,
-                    [&](std::uint64_t current, std::uint64_t) { progress_bar.update(uploaded + current, file_size); });
-                etags.push_back(etag);
-                uploaded += length;
-                progress_bar.update(uploaded, file_size);
-                last_error = nullptr;
-                break;
-            }
-            catch (...)
-            {
-                last_error = std::current_exception();
-                std::this_thread::sleep_for(std::chrono::milliseconds(500 * (attempt + 1)));
-            }
-        }
-
-        if (last_error)
-        {
-            std::rethrow_exception(last_error);
-        }
-    }
-
-    complete_upload(preflight, etags);
-    progress_bar.finish();
-    const auto finished = finish_upload(preflight);
-
-    return UploadResult{
-        .fid = json_string(finished, "fid", preflight.fid),
-        .file_name = file_name,
-        .size = file_size,
-        .fast_upload = false,
-    };
-}
-
-std::unordered_map<std::string, std::string> QuarkClient::request_download_urls(
-    const std::vector<std::string> &fids) const
+std::unordered_map<std::string, std::string>
+QuarkClient::request_download_urls(const std::vector<std::string> &fids) const
 {
     auto query = base_params();
     query.emplace_back("sys", "win32");
@@ -968,121 +925,392 @@ std::unordered_map<std::string, std::string> QuarkClient::request_download_urls(
     query.emplace_back("guid", "");
 
     const json body{{"fids", fids}};
-    const auto request_download = [&](bool desktop_ua) -> std::pair<HttpResponse, json> {
-        auto headers = download_api_headers(desktop_ua);
-        auto response = http_.request("POST", std::string(kApiBase) + "/file/download", query, headers, body.dump());
-        json result;
-        if (!response.body.empty())
-        {
-            result = response.json_body();
-        }
-        return {std::move(response), std::move(result)};
-    };
-
-    auto [response, result] = request_download(false);
-    const auto result_code = result.is_object() ? result.value("code", -1) : -1;
-    const auto result_message = result.is_object() ? result.value("message", "") : std::string();
-    if (result_code == 23018 || result_message.contains("download file size limit"))
-    {
-        std::tie(response, result) = request_download(true);
-    }
+    // URL issuance and byte reads must share the desktop identity required by
+    // large-file downloads. Changing only the URL request leaves a mismatch.
+    auto headers = api_headers();
+    for (auto &[key, value] : headers)
+        if (to_lower(key) == "user-agent")
+            value = kDesktopDownloadUa;
+    auto response = http_.request("POST", config_.api_base + "/file/download", query, headers, body.dump());
+    refresh_session_cookie(response);
+    json result;
+    if (!response.body.empty())
+        result = response.json_body();
 
     if (response.status_code < 200 || response.status_code >= 300)
     {
         auto detail = summarize_http_error(response);
-        throw QuarkException("HTTP POST 失败: " + std::to_string(response.status_code) +
+        throw QuarkException("HTTP POST failed: " + std::to_string(response.status_code) +
                              (detail.empty() ? std::string() : " | " + detail));
     }
-    ensure_api_success(result, "获取下载链接");
+    ensure_api_success(result, "Get download URL");
 
     std::unordered_map<std::string, std::string> links;
     for (const auto &item : result.at("data"))
     {
         links[json_string(item, "fid")] = json_string(item, "download_url");
     }
+    if (fids.size() == 1 && !links.contains(fids.front()) && result.at("data").size() == 1)
+        links[fids.front()] = json_string(result.at("data").front(), "download_url");
     return links;
 }
 
-void QuarkClient::collect_download_targets_recursive(const RemoteEntry &entry, const std::filesystem::path &base,
-                                                     std::vector<DownloadTarget> &output) const
+UploadResult QuarkClient::upload_file(const std::filesystem::path &local_path, const std::string &pdir_fid,
+                                      const std::optional<std::string> &new_name,
+                                      const ProgressCallback &progress) const
 {
-    if (!entry.dir)
+    if (!std::filesystem::is_regular_file(local_path))
+        throw QuarkException("Upload source is not a regular file");
+    const auto file_name = new_name.value_or(path_to_utf8(local_path.filename()));
+    validate_name(file_name);
+    const auto file_size = std::filesystem::file_size(local_path);
+    const auto modified = std::filesystem::last_write_time(local_path);
+    const auto unchanged = [&]
     {
-        output.push_back(DownloadTarget{
-            .fid = entry.fid,
-            .relative_path = base / path_from_utf8(entry.name),
-            .size = entry.size,
-        });
-        return;
+        if (std::filesystem::file_size(local_path) != file_size ||
+            std::filesystem::last_write_time(local_path) != modified)
+            throw QuarkException("Upload source changed during transfer; retry with an immutable file");
+    };
+    const auto digests = compute_file_hashes(local_path);
+    unchanged();
+    const auto preflight = prepare_upload(local_path, pdir_fid, file_name);
+    const auto fast = check_fast_upload(preflight, digests);
+    // The hash endpoint's finish flag is authoritative: a fast upload is already
+    // committed and sending a multipart finish for it can fail or create duplicates.
+    if (fast.value("finish", false))
+    {
+        if (progress)
+            progress(file_size, file_size);
+        return UploadResult{json_string(fast, "fid", preflight.fid), file_name, file_size, true};
     }
+    if (preflight.obj_key.empty() || preflight.bucket.empty() || preflight.upload_url.empty() ||
+        preflight.upload_id.empty() || preflight.auth_info.empty() || preflight.part_size == 0)
+        throw QuarkException("Multipart preflight is missing required fields");
+    const auto part_count =
+        file_size == 0 ? 1 : file_size / preflight.part_size + (file_size % preflight.part_size != 0);
+    if (part_count > 10000)
+        throw QuarkException("Provider part size exceeds the OSS 10,000 part limit for this file");
+    const auto mime_type = detect_mime_type(local_path);
+    std::vector<std::string> etags;
+    etags.reserve(static_cast<std::size_t>(part_count));
+    std::uint64_t high_water = 0;
+    std::exception_ptr callback_error;
+    const auto report = [&](std::uint64_t current)
+    {
+        if (!progress)
+            return;
+        high_water = std::max(high_water, std::min(current, file_size));
+        try
+        {
+            progress(high_water, file_size);
+        }
+        catch (...)
+        {
+            callback_error = std::current_exception();
+            throw;
+        }
+    };
+    for (std::uint64_t part = 0; part < part_count; ++part)
+    {
+        unchanged();
+        const auto offset = part * preflight.part_size;
+        const auto length = std::min(preflight.part_size, file_size - offset);
+        for (int attempt = 0;; ++attempt)
+        {
+            try
+            {
+                etags.push_back(upload_part(preflight, local_path, mime_type, offset, length, part + 1,
+                                            [&](std::uint64_t current, std::uint64_t) { report(offset + current); }));
+                report(offset + length);
+                break;
+            }
+            catch (...)
+            {
+                if (callback_error)
+                    std::rethrow_exception(callback_error);
+                if (attempt + 1 >= config_.upload_retry_count)
+                    throw;
+                std::this_thread::sleep_for(std::chrono::milliseconds(250 * (attempt + 1)));
+            }
+        }
+    }
+    unchanged();
+    complete_upload(preflight, etags);
+    const auto finished = finish_upload(preflight);
+    report(file_size);
+    return UploadResult{json_string(finished, "fid", preflight.fid), file_name, file_size, false};
+}
 
-    const auto next_base = entry.fid == "0" ? base : base / entry.name;
-    for (const auto &child : list_directory(entry.fid))
-    {
-        collect_download_targets_recursive(child, next_base, output);
-    }
+std::string QuarkClient::download_url(const std::string &fid) const
+{
+    const auto urls = request_download_urls({fid});
+    const auto it = urls.find(fid);
+    if (it == urls.end() || it->second.empty())
+        throw QuarkException("Provider returned no download URL");
+    validate_download_origin(it->second, config_.api_base);
+    return it->second;
+}
+
+void QuarkClient::collect_download_targets_recursive(const RemoteEntry &entry, const std::filesystem::path &base,
+                                                     std::vector<DownloadTarget> &output,
+                                                     std::unordered_set<std::string> &visited, unsigned depth) const
+{
+    if (depth > 128 || !visited.insert(entry.fid).second)
+        throw QuarkException("Remote directory cycle or excessive nesting");
+    const auto relative = entry.fid == "0" ? base : base / local_name(entry.name);
+    output.push_back(DownloadTarget{entry.fid, relative, entry.size, entry.dir});
+    if (entry.dir)
+        for (const auto &child : list_directory(entry.fid))
+            collect_download_targets_recursive(child, relative, output, visited, depth + 1);
 }
 
 std::vector<DownloadTarget> QuarkClient::collect_download_targets(const std::string &fid) const
 {
     std::vector<DownloadTarget> output;
-    if (fid == "0")
-    {
-        collect_download_targets_recursive(
-            RemoteEntry{.fid = "0", .name = "", .parent_fid = "", .size = 0, .dir = true, .raw = json::object()}, {},
-            output);
-        return output;
-    }
-    collect_download_targets_recursive(file_info(fid), {}, output);
+    std::unordered_set<std::string> visited;
+    collect_download_targets_recursive(file_info(fid), {}, output, visited, 0);
     return output;
 }
 
-void QuarkClient::download(const std::string &fid, const std::filesystem::path &output_root, bool resume) const
+void QuarkClient::download_entry(const RemoteEntry &entry, const std::filesystem::path &destination, bool resume,
+                                 const ProgressCallback &progress) const
 {
-    auto targets = collect_download_targets(fid);
-    if (targets.empty())
+    if (entry.dir)
+        throw QuarkException("download_to_file expects a file");
+    reject_symlink_path(destination);
+    if (std::filesystem::exists(destination))
     {
-        throw QuarkException("没有可下载的文件");
-    }
-
-    constexpr std::size_t batch_size = 20;
-    for (std::size_t offset = 0; offset < targets.size(); offset += batch_size)
-    {
-        const auto end = std::min<std::size_t>(targets.size(), offset + batch_size);
-        std::vector<std::string> batch_fids;
-        batch_fids.reserve(end - offset);
-        for (std::size_t index = offset; index < end; ++index)
+        if (!std::filesystem::is_regular_file(destination))
+            throw QuarkException("Download destination is not a regular file");
+        const auto existing = std::filesystem::file_size(destination);
+        if (resume && existing > entry.size)
+            throw QuarkException("Local file is larger than remote file; restart without resume");
+        if (resume && existing == entry.size)
         {
-            batch_fids.push_back(targets[index].fid);
-        }
-
-        const auto urls = request_download_urls(batch_fids);
-        for (std::size_t index = offset; index < end; ++index)
-        {
-            const auto &target = targets[index];
-            const auto it = urls.find(target.fid);
-            if (it == urls.end() || it->second.empty())
-            {
-                throw QuarkException("下载链接缺失，fid=" + target.fid);
-            }
-
-            const auto destination = output_root / target.relative_path;
-            ProgressBar progress_bar("download " + path_to_utf8(target.relative_path.filename()));
-            const auto response = http_.download_file(
-                it->second, file_download_headers(), destination, resume,
-                [&](std::uint64_t current, std::uint64_t total) { progress_bar.update(current, total); });
-            progress_bar.finish();
-            if (response.status_code == 416)
-            {
-                std::cout << path_to_utf8(destination) << " already complete\n";
-                continue;
-            }
-            if (response.status_code < 200 || response.status_code >= 300)
-            {
-                throw QuarkException("下载失败，HTTP 状态码: " + std::to_string(response.status_code));
-            }
+            if (progress)
+                progress(entry.size, entry.size);
+            return;
         }
     }
+    std::exception_ptr callback_error;
+    bool can_resume = resume;
+    const auto report = [&](std::uint64_t current, std::uint64_t)
+    {
+        // A failed URL lookup or rejected HTTP response must never switch a
+        // --no-resume retry into appending to an unrelated existing file.
+        if (current > 0)
+            can_resume = true;
+        if (!progress)
+            return;
+        try
+        {
+            progress(current, entry.size);
+        }
+        catch (...)
+        {
+            callback_error = std::current_exception();
+            throw;
+        }
+    };
+    for (int attempt = 0;; ++attempt)
+    {
+        try
+        {
+            // Signed URLs expire. Every retry asks the API for a fresh one and
+            // resumes the bytes already written by the streaming transport.
+            const auto url = download_url(entry.fid);
+            const auto headers = download_headers();
+            const auto response = http_.download_file(url, headers, destination, can_resume, report, entry.size);
+            if ((response.status_code < 200 || response.status_code >= 300) && response.status_code != 416)
+                throw QuarkException("Download failed, HTTP " + std::to_string(response.status_code));
+            if (!std::filesystem::exists(destination) || std::filesystem::file_size(destination) != entry.size)
+                throw QuarkException("Downloaded size does not match remote metadata");
+            return;
+        }
+        catch (...)
+        {
+            if (callback_error)
+                std::rethrow_exception(callback_error);
+            if (attempt + 1 >= config_.download_retry_count)
+                throw;
+            std::this_thread::sleep_for(std::chrono::milliseconds(250 * (attempt + 1)));
+        }
+    }
+}
+
+void QuarkClient::download_to_file(const std::string &fid, const std::filesystem::path &destination, bool resume,
+                                   const ProgressCallback &progress) const
+{
+    download_entry(file_info(fid), destination, resume, progress);
+}
+
+void QuarkClient::download(const std::string &fid, const std::filesystem::path &output_root, bool resume,
+                           const ProgressCallback &progress) const
+{
+    const auto targets = collect_download_targets(fid);
+    // Validate all materialized paths before writing any file.
+    std::unordered_set<std::string> names;
+    for (const auto &target : targets)
+    {
+        auto name = path_to_utf8(target.relative_path);
+#ifdef _WIN32
+        name = to_lower(name);
+#endif
+        if (!names.insert(name).second)
+            throw QuarkException("Remote names collide on the local filesystem");
+        reject_symlink_path(output_root / target.relative_path);
+    }
+    for (const auto &target : targets)
+    {
+        const auto destination = output_root / target.relative_path;
+        if (target.dir)
+            std::filesystem::create_directories(destination);
+        else
+            download_entry(RemoteEntry{target.fid, "", "", target.size, false, json::object()}, destination, resume,
+                           progress);
+    }
+}
+
+json QuarkClient::offline_post(const std::string &endpoint, const json &body) const
+{
+    auto headers = api_headers();
+    headers.emplace_back("X-U-Content-Encoding", "wg");
+    auto query = base_params();
+    query.emplace_back("api_ver", "2");
+    const auto response =
+        http_.request("POST", config_.offline_api_base + endpoint, query, headers, wg_encode(body.dump(), config_));
+    refresh_session_cookie(response);
+    if (response.status_code < 200 || response.status_code >= 300)
+        throw QuarkException("Offline API HTTP " + std::to_string(response.status_code) + ": " +
+                             summarize_http_error(response));
+    const auto result = to_lower(response.header("x-u-content-encoding")) == "wg"
+                            ? json::parse(wg_decode(response.body, config_))
+                            : response.json_body();
+    ensure_api_success(result, "Offline API");
+    return result.contains("data") && !result.at("data").is_null() ? result.at("data") : result;
+}
+
+json QuarkClient::offline_parse(const std::string &source) const
+{
+    if (!(source.starts_with("magnet:?") || source.starts_with("https://") || source.starts_with("http://")))
+        throw QuarkException("Offline source must be a magnet or HTTP(S) URL");
+    if (source.find_first_of("\r\n") != std::string::npos)
+        throw QuarkException("Invalid offline source");
+    const json body{{"url", source},
+                    {"fid", ""},
+                    {"title", ""},
+                    {"parse_mode", 0},
+                    {"cookie", ""},
+                    {"referer", ""},
+                    {"page_url", ""},
+                    {"entry", "download"},
+                    {"req_info", {{"method", ""}, {"body", ""}, {"is_multipart", false}}},
+                    {"conflict_mode", 4},
+                    {"save_path", ""},
+                    {"auto_download", false},
+                    {"support_v2_play", true}};
+    for (unsigned attempt = 0; attempt < std::min(15U, config_.task_poll_limit); ++attempt)
+    {
+        const auto data = offline_post("/offline/download/parse", body);
+        if (data.value("finished", false))
+        {
+            if (json_string(data, "token").empty() || !data.contains("files") || !data.at("files").is_array())
+                throw QuarkException("Offline parse response is missing token or file list");
+            return data;
+        }
+        if (attempt + 1 < std::min(15U, config_.task_poll_limit))
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    throw QuarkException("Offline resource parsing timed out");
+}
+
+json QuarkClient::offline_add(const std::string &source, const std::string &pdir_fid,
+                              const std::vector<int> &selected_files) const
+{
+    const auto parsed = offline_parse(source);
+    std::set<int> available;
+    for (const auto &file : parsed.at("files"))
+    {
+        // Quark sometimes groups a folder as comma-separated file_no values.
+        const auto ids = json_string(file, "file_no");
+        std::istringstream input(ids);
+        std::string item;
+        while (std::getline(input, item, ','))
+        {
+            int number = -1;
+            const auto [end, ec] = std::from_chars(item.data(), item.data() + item.size(), number);
+            if (ec != std::errc{} || end != item.data() + item.size() || number < 0)
+                throw QuarkException("Invalid provider file_no in offline parse response");
+            available.insert(number);
+        }
+    }
+    std::vector<int> selection = selected_files;
+    if (selection.empty())
+        selection.assign(available.begin(), available.end());
+    if (selection.empty())
+        throw QuarkException("Offline source contains no selectable files");
+    for (int id : selection)
+        if (!available.contains(id))
+            throw QuarkException("Selected offline file number does not exist");
+    std::sort(selection.begin(), selection.end());
+    selection.erase(std::unique(selection.begin(), selection.end()), selection.end());
+    auto result = offline_post("/offline/download/submit", {{"token", parsed.at("token")},
+                                                            {"entry", "download"},
+                                                            {"parse_mode", 0},
+                                                            {"pdir_fid", pdir_fid},
+                                                            {"auto_select", false},
+                                                            {"selected_files", selection},
+                                                            {"title", json_string(parsed, "title")}});
+    const auto id = json_string(result, "task_id");
+    if (id.empty())
+        throw QuarkException("Offline submission returned no task_id");
+    // Submission is an acknowledgement, not a completed cloud download.
+    result["state"] = "submitted";
+    return result;
+}
+
+json QuarkClient::offline_tasks(unsigned page, unsigned size) const
+{
+    if (page == 0 || size == 0 || size > 100)
+        throw QuarkException("Task page must be positive; size must be 1..100");
+    auto query = base_params();
+    query.insert(query.end(), {{"task_type", "5"},
+                               {"status", "0,1,2,3,4"},
+                               {"_page", std::to_string(page)},
+                               {"_size", std::to_string(size)}});
+    const auto result = api_get_json(config_.offline_api_base + "/task/current/list", query);
+    return result.value("data", json::object());
+}
+
+json QuarkClient::task_status(const std::string &task_id) const
+{
+    if (task_id.empty())
+        throw QuarkException("Missing task ID");
+    auto query = base_params();
+    query.emplace_back("task_id", task_id);
+    const auto result = api_get_json(config_.offline_api_base + "/task", query);
+    const auto data = result.contains("data") && !result.at("data").is_null() ? result.at("data") : result;
+    if (!data.contains("status"))
+        throw QuarkException("Task response did not contain status");
+    return data;
+}
+
+json QuarkClient::wait_task(const std::string &task_id) const
+{
+    for (unsigned attempt = 0; attempt < config_.task_poll_limit; ++attempt)
+    {
+        auto data = task_status(task_id);
+        const auto status = json_u64(data, "status", 99);
+        if (status == 2)
+            return data;
+        if (status == 3 || status == 4)
+            throw QuarkException("Cloud task " + task_id + (status == 3 ? " failed" : " was cancelled"));
+        if (status > 4)
+            throw QuarkException("Unrecognized cloud task status");
+        if (attempt + 1 < config_.task_poll_limit)
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
+    throw QuarkException("Cloud task is still pending; query task ID " + task_id + " again later");
 }
 
 } // namespace quarkpp

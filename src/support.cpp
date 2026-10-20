@@ -1,662 +1,694 @@
-#include "support.h"
-
-#include <curl/curl.h>
+#include <httplib.h>
 #include <openssl/evp.h>
+#include <quarkpp/support.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <charconv>
 #include <chrono>
-#include <cstdio>
-#include <cstring>
 #include <fstream>
 #include <iomanip>
-#include <iostream>
+#include <limits>
 #include <memory>
-#include <ranges>
+#include <optional>
 #include <sstream>
-
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <Windows.h>
-#endif
 
 namespace quarkpp
 {
-
 namespace
 {
+constexpr std::size_t max_api_body = 16 * 1024 * 1024;
+constexpr std::size_t transfer_buffer_size = 256 * 1024;
+constexpr unsigned max_redirects = 5;
+static_assert(sizeof(std::size_t) >= 8, "QuarkPlusPlus requires a 64-bit build for large files");
+static_assert(sizeof(std::streamoff) >= 8, "64-bit file offsets are required");
 
-struct CurlGlobalInit
+struct Url
 {
-    CurlGlobalInit()
-    {
-        const auto code = curl_global_init(CURL_GLOBAL_DEFAULT);
-        if (code != CURLE_OK)
-        {
-            throw QuarkException(std::string("curl_global_init 失败: ") + curl_easy_strerror(code));
-        }
-    }
-
-    ~CurlGlobalInit()
-    {
-        curl_global_cleanup();
-    }
+    std::string origin, target;
+    bool tls{};
 };
 
-struct CurlDeleter
+Url parse_url(const std::string &url)
 {
-    void operator()(CURL *handle) const noexcept
-    {
-        if (handle != nullptr)
-        {
-            curl_easy_cleanup(handle);
-        }
-    }
-};
-
-struct CurlSlistDeleter
-{
-    void operator()(curl_slist *list) const noexcept
-    {
-        if (list != nullptr)
-        {
-            curl_slist_free_all(list);
-        }
-    }
-};
-
-using UniqueCurl = std::unique_ptr<CURL, CurlDeleter>;
-using UniqueCurlSlist = std::unique_ptr<curl_slist, CurlSlistDeleter>;
-
-struct UploadState
-{
-    std::ifstream file;
-    std::uint64_t remaining{};
-    std::uint64_t transferred{};
-    ProgressCallback progress;
-};
-
-struct DownloadState
-{
-    std::ofstream *stream{nullptr};
-    std::uint64_t base_offset{};
-    ProgressCallback progress;
-};
-
-[[nodiscard]] CurlGlobalInit &curl_global_state()
-{
-    static CurlGlobalInit instance;
-    return instance;
+    if (url.find_first_of("\r\n\t ") != std::string::npos)
+        throw QuarkException("HTTP URL contains whitespace");
+    const auto scheme_end = url.find("://");
+    if (scheme_end == std::string::npos)
+        throw QuarkException("An absolute HTTP(S) URL is required");
+    const auto scheme = to_lower(url.substr(0, scheme_end));
+    if (scheme != "http" && scheme != "https")
+        throw QuarkException("Only HTTP and HTTPS URLs are supported");
+    const auto authority_start = scheme_end + 3;
+    const auto authority_end = url.find_first_of("/?#", authority_start);
+    const auto authority = url.substr(authority_start, authority_end - authority_start);
+    if (authority.empty() || authority.find('@') != std::string::npos)
+        throw QuarkException("HTTP URL has an empty host or embedded credentials");
+    std::string target = authority_end == std::string::npos ? "/" : url.substr(authority_end);
+    if (const auto fragment = target.find('#'); fragment != std::string::npos)
+        target.resize(fragment);
+    if (target.empty() || target.front() != '/')
+        target.insert(target.begin(), '/');
+    return {scheme + "://" + to_lower(authority), std::move(target), scheme == "https"};
 }
 
-[[nodiscard]] std::string append_query(const std::string &url, const QueryList &query)
+std::string append_query(const std::string &url, const QueryList &query)
 {
-    if (query.empty())
-    {
-        return url;
-    }
-
-    std::ostringstream builder;
-    builder << url;
-    builder << (url.contains('?') ? '&' : '?');
-
-    bool first = true;
+    std::string result = url;
     for (const auto &[key, value] : query)
     {
-        if (!first)
-        {
-            builder << '&';
-        }
-        first = false;
-        builder << url_encode(key) << '=' << url_encode(value);
+        result += result.find('?') == std::string::npos ? '?' : '&';
+        result += url_encode(key) + "=" + url_encode(value);
     }
-    return builder.str();
+    return result;
 }
 
-[[nodiscard]] UniqueCurl make_curl()
+bool redirect_status(int status)
 {
-    static_cast<void>(curl_global_state());
-    UniqueCurl handle(curl_easy_init());
-    if (!handle)
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+std::string redirect_url(const std::string &current, const std::string &location)
+{
+    if (location.empty())
+        throw QuarkException("HTTP redirect is missing Location");
+    const auto from = parse_url(current);
+    std::string next;
+    if (location.find("://") != std::string::npos)
+        next = location;
+    else if (location.starts_with("//"))
+        next = std::string(from.tls ? "https:" : "http:") + location;
+    else if (location.front() == '/')
+        next = from.origin + location;
+    else if (location.front() == '?')
+        next = from.origin + from.target.substr(0, from.target.find('?')) + location;
+    else
     {
-        throw QuarkException("curl_easy_init 失败");
+        const auto path = from.target.substr(0, from.target.find('?'));
+        next = from.origin + path.substr(0, path.rfind('/') + 1) + location;
     }
-    return handle;
+    if (from.tls && !parse_url(next).tls)
+        throw QuarkException("Refusing an HTTPS to HTTP redirect");
+    return next;
 }
 
-[[nodiscard]] UniqueCurlSlist make_headers(const HeaderList &headers)
+void redirect_headers(HeaderList &headers, const std::string &from, const std::string &to)
 {
-    curl_slist *list = nullptr;
+    const bool cross_origin = parse_url(from).origin != parse_url(to).origin;
+    std::erase_if(headers,
+                  [cross_origin](const auto &header)
+                  {
+                      const auto key = to_lower(header.first);
+                      if (key == "host")
+                          return true;
+                      // Allowlisting prevents cookies, authorization and custom credentials
+                      // from reaching an unrelated CDN or redirect destination.
+                      return cross_origin && key != "accept" && key != "accept-encoding" && key != "user-agent" &&
+                             key != "range" && key != "if-range";
+                  });
+}
+
+httplib::Headers make_headers(const HeaderList &headers)
+{
+    httplib::Headers result;
     for (const auto &[key, value] : headers)
     {
-        const auto header = key + ": " + value;
-        list = curl_slist_append(list, header.c_str());
-        if (list == nullptr)
-        {
-            throw QuarkException("构建请求头失败");
-        }
+        if (key.empty() || key.find_first_of("\r\n:") != std::string::npos ||
+            value.find_first_of("\r\n") != std::string::npos)
+            throw QuarkException("Invalid HTTP header");
+        const auto lower = to_lower(key);
+        if (lower != "accept-encoding" && lower != "content-length" && lower != "transfer-encoding")
+            result.emplace(key, value);
     }
-    return UniqueCurlSlist(list);
+    result.emplace("Accept-Encoding", "identity");
+    return result;
 }
 
-void set_common_curl_options(CURL *curl, unsigned timeout_ms, HttpResponse &response)
+std::unique_ptr<httplib::Client> make_client(const Url &url, unsigned timeout_ms, const std::string &ca_bundle)
 {
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(timeout_ms));
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_ms));
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-    curl_easy_setopt(
-        curl, CURLOPT_WRITEFUNCTION,
-        +[](char *ptr, std::size_t size, std::size_t nmemb, void *userdata) -> std::size_t {
-            auto *body = static_cast<std::string *>(userdata);
-            body->append(ptr, size * nmemb);
-            return size * nmemb;
-        });
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
-    curl_easy_setopt(
-        curl, CURLOPT_HEADERFUNCTION,
-        +[](char *buffer, std::size_t size, std::size_t nitems, void *userdata) -> std::size_t {
-            const std::size_t total = size * nitems;
-            auto *response_ptr = static_cast<HttpResponse *>(userdata);
-            std::string_view line(buffer, total);
-            const auto separator = line.find(':');
-            if (separator != std::string_view::npos)
-            {
-                auto key = to_lower(trim(line.substr(0, separator)));
-                auto value = trim(line.substr(separator + 1));
-                if (!key.empty())
-                {
-                    response_ptr->headers[key] = value;
-                }
-            }
-            return total;
-        });
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response);
+    auto client = std::make_unique<httplib::Client>(url.origin);
+    if (!client->is_valid())
+        throw QuarkException("Cannot initialize HTTP client (HTTPS requires OpenSSL support)");
+    client->set_follow_location(false);
+    client->set_path_encode(false); // Preserve signed OSS URL bytes.
+    client->set_decompress(false);
+    const auto timeout = std::chrono::milliseconds(timeout_ms);
+    client->set_connection_timeout(timeout);
+    client->set_read_timeout(timeout);
+    client->set_write_timeout(timeout);
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+    client->enable_server_certificate_verification(true);
+    client->enable_server_hostname_verification(true);
+    if (!ca_bundle.empty())
+        client->set_ca_cert_path(ca_bundle.c_str());
+#else
+    static_cast<void>(ca_bundle);
+    if (url.tls)
+        throw QuarkException("HTTPS requires a cpp-httplib build with OpenSSL enabled");
+#endif
+    return client;
 }
 
-void finalize_response(CURL *curl, HttpResponse &response)
+void capture_response(const httplib::Response &source, const std::string &url, HttpResponse &response)
 {
-    long status_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
-    response.status_code = static_cast<int>(status_code);
-
-    char *effective_url = nullptr;
-    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
-    if (effective_url != nullptr)
+    response.status_code = source.status;
+    response.url = url;
+    response.headers.clear();
+    response.set_cookies.clear();
+    for (const auto &[key, value] : source.headers)
     {
-        response.url = effective_url;
+        response.headers[to_lower(key)] = value;
+        if (to_lower(key) == "set-cookie")
+            response.set_cookies.push_back(value);
     }
 }
 
-void perform_checked(CURL *curl, const std::string &action, HttpResponse &response)
+void check_result(const httplib::Result &result, const std::string &error)
 {
-    char error_buffer[CURL_ERROR_SIZE] = {};
-    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
-
-    const auto code = curl_easy_perform(curl);
-    if (code != CURLE_OK)
-    {
-        std::string message = action + "失败: " + curl_easy_strerror(code);
-        if (error_buffer[0] != '\0')
-        {
-            message += " | ";
-            message += error_buffer;
-        }
-        throw QuarkException(message);
-    }
-
-    finalize_response(curl, response);
+    if (!error.empty())
+        throw QuarkException(error);
+    if (!result)
+        throw QuarkException("HTTP transport failed: " + httplib::to_string(result.error()));
 }
 
-[[nodiscard]] std::string digest_to_hex(const std::filesystem::path &file_path, const EVP_MD *algorithm)
+std::optional<std::uint64_t> parse_unsigned(std::string_view value)
 {
-    std::ifstream input(file_path, std::ios::binary);
-    if (!input)
-    {
-        throw QuarkException("无法打开文件用于哈希计算: " + path_to_utf8(file_path));
-    }
-
-    using EvpCtx = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
-    EvpCtx ctx(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
-    if (!ctx)
-    {
-        throw QuarkException("创建 OpenSSL 哈希上下文失败");
-    }
-    if (EVP_DigestInit_ex(ctx.get(), algorithm, nullptr) != 1)
-    {
-        throw QuarkException("初始化 OpenSSL 哈希失败");
-    }
-
-    std::vector<char> buffer(8 * 1024 * 1024);
-    while (input)
-    {
-        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-        const auto read = input.gcount();
-        if (read <= 0)
-        {
-            break;
-        }
-        if (EVP_DigestUpdate(ctx.get(), buffer.data(), static_cast<std::size_t>(read)) != 1)
-        {
-            throw QuarkException("更新 OpenSSL 哈希失败");
-        }
-    }
-
-    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
-    unsigned digest_length = 0;
-    if (EVP_DigestFinal_ex(ctx.get(), digest.data(), &digest_length) != 1)
-    {
-        throw QuarkException("完成 OpenSSL 哈希失败");
-    }
-
-    std::ostringstream output;
-    output << std::hex << std::setfill('0');
-    for (unsigned index = 0; index < digest_length; ++index)
-    {
-        output << std::setw(2) << static_cast<int>(digest[index]);
-    }
-    return output.str();
+    if (value.empty())
+        return std::nullopt;
+    std::uint64_t result{};
+    const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), result);
+    if (ec != std::errc() || end != value.data() + value.size())
+        return std::nullopt;
+    return result;
 }
 
-[[nodiscard]] std::string base64_from_bytes(const unsigned char *data, std::size_t size)
+struct ContentRange
 {
-    const auto encoded_size = 4 * ((size + 2) / 3);
-    std::string encoded(encoded_size, '\0');
+    std::uint64_t start{}, end{}, total{};
+    bool unsatisfied{};
+};
+
+std::optional<ContentRange> parse_content_range(std::string_view value)
+{
+    if (!value.starts_with("bytes "))
+        return std::nullopt;
+    value.remove_prefix(6);
+    const auto slash = value.find('/');
+    if (slash == std::string_view::npos)
+        return std::nullopt;
+    const auto total = parse_unsigned(value.substr(slash + 1));
+    if (!total)
+        return std::nullopt;
+    const auto interval = value.substr(0, slash);
+    if (interval == "*")
+        return ContentRange{0, 0, *total, true};
+    const auto dash = interval.find('-');
+    if (dash == std::string_view::npos)
+        return std::nullopt;
+    const auto start = parse_unsigned(interval.substr(0, dash));
+    const auto end = parse_unsigned(interval.substr(dash + 1));
+    if (!start || !end || *start > *end || *end >= *total)
+        return std::nullopt;
+    return ContentRange{*start, *end, *total, false};
+}
+
+std::string base64_from_bytes(const unsigned char *data, std::size_t size)
+{
+    if (size > static_cast<std::size_t>(std::numeric_limits<int>::max() / 4 * 3))
+        throw QuarkException("Base64 input is too large");
+    std::string encoded(4 * ((size + 2) / 3) + 1, '\0');
     const auto written =
         EVP_EncodeBlock(reinterpret_cast<unsigned char *>(encoded.data()), data, static_cast<int>(size));
     if (written < 0)
-    {
-        throw QuarkException("OpenSSL Base64 编码失败");
-    }
+        throw QuarkException("OpenSSL Base64 encoding failed");
     encoded.resize(static_cast<std::size_t>(written));
     return encoded;
 }
 
-std::size_t read_upload_callback(char *buffer, std::size_t size, std::size_t nmemb, void *userdata)
+std::string finish_digest(EVP_MD_CTX *ctx)
 {
-    auto *state = static_cast<UploadState *>(userdata);
-    if (state->remaining == 0)
-    {
-        return 0;
-    }
-
-    const auto capacity = static_cast<std::uint64_t>(size * nmemb);
-    const auto to_read = static_cast<std::size_t>(std::min<std::uint64_t>(state->remaining, capacity));
-    state->file.read(buffer, static_cast<std::streamsize>(to_read));
-    const auto read = static_cast<std::size_t>(state->file.gcount());
-    state->remaining -= read;
-    state->transferred += read;
-    return read;
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned size{};
+    if (EVP_DigestFinal_ex(ctx, digest.data(), &size) != 1)
+        throw QuarkException("OpenSSL digest finalization failed");
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (unsigned i = 0; i < size; ++i)
+        output << std::setw(2) << static_cast<unsigned>(digest[i]);
+    return output.str();
 }
-
-int xfer_info_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow)
-{
-    auto *state = static_cast<UploadState *>(clientp);
-    if (state != nullptr && state->progress)
-    {
-        const auto total = ultotal > 0 ? static_cast<std::uint64_t>(ultotal) : state->transferred;
-        state->progress(static_cast<std::uint64_t>(ulnow), total);
-    }
-    return 0;
-}
-
-std::size_t write_download_callback(char *ptr, std::size_t size, std::size_t nmemb, void *userdata)
-{
-    auto *state = static_cast<DownloadState *>(userdata);
-    const auto bytes = size * nmemb;
-    state->stream->write(ptr, static_cast<std::streamsize>(bytes));
-    return state->stream->good() ? bytes : 0;
-}
-
-int download_progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t)
-{
-    auto *state = static_cast<DownloadState *>(clientp);
-    if (state != nullptr && state->progress)
-    {
-        const auto current = state->base_offset + static_cast<std::uint64_t>(std::max<curl_off_t>(0, dlnow));
-        const auto total = dltotal > 0 ? state->base_offset + static_cast<std::uint64_t>(dltotal) : 0;
-        state->progress(current, total);
-    }
-    return 0;
-}
-
-#if defined(_WIN32)
-[[nodiscard]] std::string wide_to_utf8(std::wstring_view value)
-{
-    if (value.empty())
-    {
-        return {};
-    }
-
-    const auto size =
-        WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    if (size <= 0)
-    {
-        throw QuarkException("宽字符转 UTF-8 失败");
-    }
-
-    std::string result(static_cast<std::size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size, nullptr,
-                        nullptr);
-    return result;
-}
-
-[[nodiscard]] std::wstring utf8_to_wide(std::string_view value)
-{
-    if (value.empty())
-    {
-        return {};
-    }
-
-    const auto size = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
-    if (size <= 0)
-    {
-        throw QuarkException("UTF-8 转宽字符失败");
-    }
-
-    std::wstring result(static_cast<std::size_t>(size), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size);
-    return result;
-}
-#endif
-
 } // namespace
 
 QuarkException::QuarkException(const std::string &message) : std::runtime_error(message)
 {
 }
-
-std::filesystem::path path_from_utf8(std::string_view value)
-{
-#if defined(_WIN32)
-    return std::filesystem::path(utf8_to_wide(value));
-#else
-    return std::filesystem::path(std::string(value));
-#endif
-}
-
-std::string path_to_utf8(const std::filesystem::path &value)
-{
-#if defined(_WIN32)
-    return wide_to_utf8(value.native());
-#else
-    return value.string();
-#endif
-}
-
 std::string HttpResponse::header(std::string_view key) const
 {
     const auto it = headers.find(to_lower(std::string(key)));
-    return it == headers.end() ? std::string() : it->second;
+    return it == headers.end() ? std::string{} : it->second;
 }
-
 json HttpResponse::json_body() const
 {
     try
     {
         return json::parse(body);
     }
-    catch (const std::exception &error)
+    catch (const json::exception &error)
     {
-        throw QuarkException("响应不是合法 JSON: " + std::string(error.what()));
+        throw QuarkException("Invalid JSON response: " + std::string(error.what()));
     }
 }
-
-HttpClient::HttpClient(unsigned timeout_ms) : timeout_ms_(timeout_ms)
+HttpClient::HttpClient(unsigned timeout_ms, std::string ca_bundle)
+    : timeout_ms_(timeout_ms), ca_bundle_(std::move(ca_bundle))
 {
-    static_cast<void>(curl_global_state());
+    if (timeout_ms == 0)
+        throw QuarkException("HTTP timeout must be positive");
 }
 
 HttpResponse HttpClient::request(std::string method, const std::string &url, const QueryList &query,
-                                 const HeaderList &headers, const std::string &body) const
+                                 const HeaderList &headers, const std::string &body, bool follow_redirects) const
 {
-    HttpResponse response;
-    const auto full_url = append_query(url, query);
-    auto curl = make_curl();
-    auto header_list = make_headers(headers);
-
-    curl_easy_setopt(curl.get(), CURLOPT_URL, full_url.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_list.get());
-    curl_easy_setopt(curl.get(), CURLOPT_CUSTOMREQUEST, method.c_str());
-    set_common_curl_options(curl.get(), timeout_ms_, response);
-
-    if (!body.empty())
+    std::string current = append_query(url, query);
+    auto active_headers = headers;
+    for (unsigned attempt = 0; attempt <= max_redirects; ++attempt)
     {
-        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, body.data());
-        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
+        const auto parsed = parse_url(current);
+        auto client = make_client(parsed, timeout_ms_, ca_bundle_);
+        HttpResponse response;
+        std::string error;
+        httplib::Request req;
+        req.method = method;
+        req.path = parsed.target;
+        req.headers = make_headers(active_headers);
+        req.body = body;
+        req.response_handler = [&](const httplib::Response &res)
+        {
+            capture_response(res, current, response);
+            return true;
+        };
+        req.content_receiver = [&](const char *data, std::size_t size, std::uint64_t, std::uint64_t)
+        {
+            if (size > max_api_body - response.body.size())
+            {
+                error = "HTTP API response exceeds the 16 MiB limit";
+                return false;
+            }
+            response.body.append(data, size);
+            return true;
+        };
+        const auto result = client->send(req);
+        check_result(result, error);
+        // cpp-httplib omits response_handler for HEAD and bodyless statuses.
+        capture_response(*result, current, response);
+        if (!follow_redirects || !redirect_status(response.status_code))
+            return response;
+        const auto next = redirect_url(current, response.header("location"));
+        if (!body.empty() && parse_url(next).origin != parsed.origin)
+            throw QuarkException("Refusing to redirect an HTTP request body to another origin");
+        if (method != "GET" && method != "HEAD")
+        {
+            if (response.status_code != 307 && response.status_code != 308)
+                throw QuarkException("Refusing a redirect that changes a mutating HTTP request");
+            if (parse_url(next).origin != parsed.origin)
+                throw QuarkException("Refusing to redirect an HTTP request body to another origin");
+        }
+        redirect_headers(active_headers, current, next);
+        current = next;
     }
-    else if (method == "POST")
-    {
-        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, "");
-        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(0));
-    }
+    throw QuarkException("HTTP redirect limit exceeded");
+}
 
-    perform_checked(curl.get(), "HTTP 请求", response);
-    return response;
+HttpResponse HttpClient::request_stream(const std::string &url, const HeaderList &headers,
+                                        const std::function<bool(const HttpResponse &)> &on_response,
+                                        const std::function<bool(const char *, std::size_t)> &on_chunk) const
+{
+    std::string current = url;
+    auto active_headers = headers;
+    for (unsigned attempt = 0; attempt <= max_redirects; ++attempt)
+    {
+        const auto parsed = parse_url(current);
+        auto client = make_client(parsed, timeout_ms_, ca_bundle_);
+        HttpResponse response;
+        std::string error;
+        httplib::Request req;
+        req.method = "GET";
+        req.path = parsed.target;
+        req.headers = make_headers(active_headers);
+        req.response_handler = [&](const httplib::Response &res)
+        {
+            capture_response(res, current, response);
+            if (redirect_status(res.status))
+                return true;
+            if (on_response && !on_response(response))
+            {
+                error = "Streaming HTTP response rejected by receiver";
+                return false;
+            }
+            return true;
+        };
+        req.content_receiver = [&](const char *data, std::size_t size, std::uint64_t, std::uint64_t)
+        {
+            if (redirect_status(response.status_code))
+                return true;
+            if (on_chunk && !on_chunk(data, size))
+            {
+                error = "Streaming HTTP transfer canceled by receiver";
+                return false;
+            }
+            return true;
+        };
+        const auto result = client->send(req);
+        check_result(result, error);
+        if (response.status_code == 0)
+        {
+            capture_response(*result, current, response);
+            if (on_response && !on_response(response))
+                throw QuarkException("Streaming HTTP response rejected by receiver");
+        }
+        if (!redirect_status(response.status_code))
+            return response;
+        const auto next = redirect_url(current, response.header("location"));
+        redirect_headers(active_headers, current, next);
+        current = next;
+    }
+    throw QuarkException("HTTP redirect limit exceeded");
 }
 
 HttpResponse HttpClient::upload_file_range(const std::string &url, const QueryList &query, const HeaderList &headers,
                                            const std::filesystem::path &file_path, std::uint64_t offset,
                                            std::uint64_t length, const ProgressCallback &progress) const
 {
-    UploadState state;
-    state.file.open(file_path, std::ios::binary);
-    if (!state.file)
+    const auto file_size = std::filesystem::file_size(file_path);
+    if (offset > file_size || length > file_size - offset ||
+        offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
+        length > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) - offset)
+        throw QuarkException("Upload range lies outside the source file");
+    std::ifstream input(file_path, std::ios::binary);
+    if (!input)
+        throw QuarkException("Cannot open upload file: " + path_to_utf8(file_path));
+    std::string current = append_query(url, query);
+    auto active_headers = headers;
+    std::vector<char> buffer(transfer_buffer_size);
+    for (unsigned attempt = 0; attempt <= max_redirects; ++attempt)
     {
-        throw QuarkException("无法打开上传文件: " + path_to_utf8(file_path));
+        const auto parsed = parse_url(current);
+        auto client = make_client(parsed, timeout_ms_, ca_bundle_);
+        HttpResponse response;
+        std::string error;
+        httplib::Request req;
+        req.method = "PUT";
+        req.path = parsed.target;
+        req.headers = make_headers(active_headers);
+        req.content_length_ = static_cast<std::size_t>(length);
+        req.content_provider_ = [&](std::size_t position, std::size_t requested, httplib::DataSink &sink)
+        {
+            if (position > length || requested > length - position)
+            {
+                error = "Invalid upload provider range";
+                return false;
+            }
+            input.clear();
+            input.seekg(static_cast<std::streamoff>(offset + position));
+            if (!input)
+            {
+                error = "Cannot seek upload source file";
+                return false;
+            }
+            std::size_t sent{};
+            while (sent < requested)
+            {
+                const auto count = std::min(buffer.size(), requested - sent);
+                input.read(buffer.data(), static_cast<std::streamsize>(count));
+                if (input.gcount() != static_cast<std::streamsize>(count) || input.bad())
+                {
+                    error = "Upload source became unreadable or shorter during transfer";
+                    return false;
+                }
+                if (!sink.write(buffer.data(), count))
+                    return false;
+                sent += count;
+                if (progress)
+                    progress(static_cast<std::uint64_t>(position + sent), length);
+            }
+            return true;
+        };
+        req.response_handler = [&](const httplib::Response &res)
+        {
+            capture_response(res, current, response);
+            return true;
+        };
+        req.content_receiver = [&](const char *data, std::size_t size, std::uint64_t, std::uint64_t)
+        {
+            if (size > max_api_body - response.body.size())
+            {
+                error = "Upload response exceeds the 16 MiB limit";
+                return false;
+            }
+            response.body.append(data, size);
+            return true;
+        };
+        const auto result = client->send(req);
+        check_result(result, error);
+        capture_response(*result, current, response);
+        if (!redirect_status(response.status_code))
+        {
+            if (progress && response.status_code >= 200 && response.status_code < 300)
+                progress(length, length);
+            return response;
+        }
+        const auto next = redirect_url(current, response.header("location"));
+        if ((response.status_code != 307 && response.status_code != 308) || parse_url(next).origin != parsed.origin)
+            throw QuarkException("Refusing an unsafe upload redirect");
+        redirect_headers(active_headers, current, next);
+        current = next;
     }
-    state.file.seekg(static_cast<std::streamoff>(offset));
-    state.remaining = length;
-    state.transferred = 0;
-    state.progress = progress;
-
-    HttpResponse response;
-    const auto full_url = append_query(url, query);
-    auto curl = make_curl();
-    auto header_list = make_headers(headers);
-
-    curl_easy_setopt(curl.get(), CURLOPT_URL, full_url.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_list.get());
-    curl_easy_setopt(curl.get(), CURLOPT_UPLOAD, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(length));
-    curl_easy_setopt(curl.get(), CURLOPT_READFUNCTION, &read_upload_callback);
-    curl_easy_setopt(curl.get(), CURLOPT_READDATA, &state);
-    curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, &xfer_info_callback);
-    curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &state);
-    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
-    set_common_curl_options(curl.get(), timeout_ms_, response);
-
-    perform_checked(curl.get(), "分片上传", response);
-    if (progress)
-    {
-        progress(length, length);
-    }
-    return response;
+    throw QuarkException("HTTP redirect limit exceeded");
 }
 
 HttpResponse HttpClient::download_file(const std::string &url, const HeaderList &headers,
                                        const std::filesystem::path &output_path, bool resume,
-                                       const ProgressCallback &progress) const
+                                       const ProgressCallback &progress,
+                                       std::optional<std::uint64_t> expected_size) const
 {
-    std::filesystem::create_directories(output_path.parent_path());
-
-    std::uint64_t base_offset = 0;
-    if (resume && std::filesystem::exists(output_path) && std::filesystem::is_regular_file(output_path))
+    const bool exists = std::filesystem::exists(output_path);
+    if (exists && !std::filesystem::is_regular_file(output_path))
+        throw QuarkException("Download destination must be a regular file");
+    const std::uint64_t base = resume && exists ? std::filesystem::file_size(output_path) : 0;
+    if (expected_size && base > *expected_size)
+        throw QuarkException("Local partial file is larger than the expected download size");
+    auto active_headers = headers;
+    std::erase_if(active_headers, [](const auto &h) { return to_lower(h.first) == "range"; });
+    if (base > 0)
+        active_headers.emplace_back("Range", "bytes=" + std::to_string(base) + "-");
+    std::string current = url;
+    for (unsigned attempt = 0; attempt <= max_redirects; ++attempt)
     {
-        base_offset = std::filesystem::file_size(output_path);
-    }
-
-    std::ofstream file(output_path, std::ios::binary | (base_offset > 0 ? std::ios::app : std::ios::trunc));
-    if (!file)
-    {
-        throw QuarkException("无法打开下载输出文件: " + path_to_utf8(output_path));
-    }
-
-    DownloadState state{
-        .stream = &file,
-        .base_offset = base_offset,
-        .progress = progress,
-    };
-
-    auto request_headers = headers;
-    if (base_offset > 0)
-    {
-        request_headers.emplace_back("Range", "bytes=" + std::to_string(base_offset) + "-");
-    }
-
-    HttpResponse response;
-    auto curl = make_curl();
-    auto header_list = make_headers(request_headers);
-
-    curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_list.get());
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, &write_download_callback);
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &state);
-    curl_easy_setopt(
-        curl.get(), CURLOPT_HEADERFUNCTION,
-        +[](char *buffer, std::size_t size, std::size_t nitems, void *userdata) -> std::size_t {
-            const std::size_t total = size * nitems;
-            auto *response_ptr = static_cast<HttpResponse *>(userdata);
-            std::string_view line(buffer, total);
-            const auto separator = line.find(':');
-            if (separator != std::string_view::npos)
+        const auto parsed = parse_url(current);
+        auto client = make_client(parsed, timeout_ms_, ca_bundle_);
+        HttpResponse response;
+        std::string error;
+        std::ofstream output;
+        std::uint64_t received{}, total = expected_size.value_or(0);
+        std::optional<std::uint64_t> expected;
+        if (expected_size)
+            expected = *expected_size - base;
+        bool already_complete = false;
+        httplib::Request req;
+        req.method = "GET";
+        req.path = parsed.target;
+        req.headers = make_headers(active_headers);
+        req.response_handler = [&](const httplib::Response &res)
+        {
+            capture_response(res, current, response);
+            if (redirect_status(res.status))
+                return true;
+            const auto range = parse_content_range(response.header("content-range"));
+            if (res.status == 416)
             {
-                auto key = to_lower(trim(line.substr(0, separator)));
-                auto value = trim(line.substr(separator + 1));
-                if (!key.empty())
-                {
-                    response_ptr->headers[key] = value;
-                }
+                already_complete = base > 0 && range && range->unsatisfied && range->total == base &&
+                                   (!expected_size || *expected_size == base);
+                if (!already_complete)
+                    error = "Download range is unsatisfiable and the local file is not a confirmed complete file";
+                return false;
             }
-            return total;
-        });
-    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &response);
-    curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, &download_progress_callback);
-    curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &state);
-    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_MAXREDIRS, 10L);
-    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(timeout_ms_));
-    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_ms_));
-    curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_ACCEPT_ENCODING, "");
-
-    perform_checked(curl.get(), "文件下载", response);
-    return response;
-}
-
-ProgressBar::ProgressBar(std::string label)
-    : label_(std::move(label)), started_(std::chrono::steady_clock::now()), last_rendered_(started_)
-{
-}
-
-void ProgressBar::update(std::uint64_t current, std::uint64_t total)
-{
-    if (finished_)
-    {
-        return;
+            if (res.status != 200 && res.status != 206)
+            {
+                error = "Download returned HTTP " + std::to_string(res.status);
+                return false;
+            }
+            const auto encoding = to_lower(response.header("content-encoding"));
+            if (!encoding.empty() && encoding != "identity")
+            {
+                error = "Download server ignored Accept-Encoding: identity";
+                return false;
+            }
+            if (res.status == 206)
+            {
+                if (!range || range->unsatisfied || range->start != base || range->end + 1 != range->total)
+                {
+                    error = "Download Content-Range does not match the requested offset and total";
+                    return false;
+                }
+                if (expected_size && range->total != *expected_size)
+                {
+                    error = "Download Content-Range total does not match the expected file size";
+                    return false;
+                }
+                expected = range->total - base;
+                total = range->total;
+            }
+            else if (base > 0)
+            {
+                error = "Download server ignored Range; existing partial file was preserved";
+                return false;
+            }
+            const auto content_length = response.header("content-length");
+            if (!content_length.empty())
+            {
+                const auto length = parse_unsigned(content_length);
+                if (!length || (expected && *expected != *length))
+                {
+                    error = "Download Content-Length does not match Content-Range";
+                    return false;
+                }
+                expected = *length;
+                total = base + *length;
+            }
+            if (!output_path.parent_path().empty())
+                std::filesystem::create_directories(output_path.parent_path());
+            output.open(output_path, std::ios::binary | (base > 0 ? std::ios::app : std::ios::trunc));
+            if (!output)
+            {
+                error = "Cannot open download destination: " + path_to_utf8(output_path);
+                return false;
+            }
+            return true;
+        };
+        req.content_receiver = [&](const char *data, std::size_t size, std::uint64_t, std::uint64_t)
+        {
+            if (redirect_status(response.status_code))
+                return true;
+            if (!output || (expected && size > *expected - received))
+            {
+                error = "Download body exceeds the validated byte range";
+                return false;
+            }
+            output.write(data, static_cast<std::streamsize>(size));
+            if (!output)
+            {
+                error = "Failed writing download destination (check available disk space)";
+                return false;
+            }
+            received += size;
+            if (progress)
+                progress(base + received, total);
+            return true;
+        };
+        const auto result = client->send(req);
+        if (output.is_open())
+        {
+            output.flush();
+            if (!output && error.empty())
+                error = "Failed flushing download destination";
+            output.close();
+        }
+        if (already_complete)
+        {
+            if (progress)
+                progress(base, base);
+            return response;
+        }
+        check_result(result, error);
+        if (response.status_code == 0)
+        {
+            capture_response(*result, current, response);
+            throw QuarkException("Download returned HTTP " + std::to_string(response.status_code));
+        }
+        if (redirect_status(response.status_code))
+        {
+            const auto next = redirect_url(current, response.header("location"));
+            redirect_headers(active_headers, current, next);
+            current = next;
+            continue;
+        }
+        if (expected && received != *expected)
+            throw QuarkException("Download ended before the validated byte range was complete");
+        if (progress)
+            progress(base + received, total ? total : base + received);
+        return response;
     }
-
-    const auto now = std::chrono::steady_clock::now();
-    if (current < total && now - last_rendered_ < std::chrono::milliseconds(100))
-    {
-        return;
-    }
-    last_rendered_ = now;
-
-    const auto elapsed = std::chrono::duration<double>(now - started_).count();
-    const auto speed = elapsed <= 0.0 ? 0.0 : static_cast<double>(current) / elapsed;
-
-    std::ostringstream line;
-    line << '\r' << label_ << " | " << format_bytes(current);
-    if (total > 0)
-    {
-        const auto percent =
-            std::clamp((static_cast<double>(current) * 100.0) / static_cast<double>(total), 0.0, 100.0);
-        line << " / " << format_bytes(total) << " | " << std::fixed << std::setprecision(1) << percent << "%";
-    }
-    line << " | " << format_bytes(static_cast<std::uint64_t>(speed)) << "/s";
-    std::cout << line.str() << std::flush;
-
-    if (total > 0 && current >= total)
-    {
-        finish();
-    }
-}
-
-void ProgressBar::finish()
-{
-    if (finished_)
-    {
-        return;
-    }
-    finished_ = true;
-    std::cout << '\n';
+    throw QuarkException("HTTP redirect limit exceeded");
 }
 
 std::string trim(std::string_view value)
 {
-    std::size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0)
-    {
+    std::size_t start{}, end = value.size();
+    while (start < end && std::isspace(static_cast<unsigned char>(value[start])))
         ++start;
-    }
-
-    std::size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0)
-    {
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])))
         --end;
-    }
     return std::string(value.substr(start, end - start));
 }
-
 std::string to_lower(std::string value)
 {
-    std::ranges::transform(value, value.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
 }
-
 std::string url_encode(std::string_view value)
 {
-    std::ostringstream encoded;
-    encoded << std::uppercase << std::hex;
-    for (const auto byte : value)
+    constexpr char hex[] = "0123456789ABCDEF";
+    std::string encoded;
+    for (const unsigned char c : value)
     {
-        const unsigned char current = static_cast<unsigned char>(byte);
-        if (std::isalnum(current) != 0 || current == '-' || current == '_' || current == '.' || current == '~')
-        {
-            encoded << static_cast<char>(current);
-        }
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+            c == '.' || c == '~')
+            encoded += static_cast<char>(c);
         else
         {
-            encoded << '%' << std::setw(2) << std::setfill('0') << static_cast<int>(current);
+            encoded += '%';
+            encoded += hex[c >> 4];
+            encoded += hex[c & 15];
         }
     }
-    return encoded.str();
+    return encoded;
 }
-
 std::string base64_encode(const std::string &value)
 {
     return base64_from_bytes(reinterpret_cast<const unsigned char *>(value.data()), value.size());
 }
-
 std::string md5_base64(const std::string &value)
 {
     std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
-    unsigned digest_length = 0;
-    if (EVP_Digest(value.data(), value.size(), digest.data(), &digest_length, EVP_md5(), nullptr) != 1)
-    {
-        throw QuarkException("OpenSSL MD5 失败");
-    }
-    return base64_from_bytes(digest.data(), digest_length);
+    unsigned size{};
+    if (EVP_Digest(value.data(), value.size(), digest.data(), &size, EVP_md5(), nullptr) != 1)
+        throw QuarkException("OpenSSL MD5 failed");
+    return base64_from_bytes(digest.data(), size);
 }
-
+HashDigests compute_file_hashes(const std::filesystem::path &file_path)
+{
+    std::ifstream input(file_path, std::ios::binary);
+    if (!input)
+        throw QuarkException("Cannot open file for hashing: " + path_to_utf8(file_path));
+    using Context = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+    Context md5(EVP_MD_CTX_new(), EVP_MD_CTX_free), sha1(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    if (!md5 || !sha1 || EVP_DigestInit_ex(md5.get(), EVP_md5(), nullptr) != 1 ||
+        EVP_DigestInit_ex(sha1.get(), EVP_sha1(), nullptr) != 1)
+        throw QuarkException("OpenSSL hash initialization failed");
+    std::vector<char> buffer(1024 * 1024);
+    while (input)
+    {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto count = input.gcount();
+        if (count > 0 && (EVP_DigestUpdate(md5.get(), buffer.data(), static_cast<std::size_t>(count)) != 1 ||
+                          EVP_DigestUpdate(sha1.get(), buffer.data(), static_cast<std::size_t>(count)) != 1))
+            throw QuarkException("OpenSSL hash update failed");
+    }
+    if (input.bad() || !input.eof())
+        throw QuarkException("File read failed during hashing");
+    return {finish_digest(md5.get()), finish_digest(sha1.get())};
+}
 std::string gmt_http_date_now()
 {
     const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
@@ -666,67 +698,54 @@ std::string gmt_http_date_now()
 #else
     gmtime_r(&now, &utc);
 #endif
-
     std::ostringstream output;
     output.imbue(std::locale::classic());
     output << std::put_time(&utc, "%a, %d %b %Y %H:%M:%S GMT");
     return output.str();
 }
-
+std::uint64_t unix_time_milliseconds_now()
+{
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
 std::string format_bytes(std::uint64_t bytes)
 {
-    constexpr std::array<std::string_view, 5> units{"B", "KB", "MB", "GB", "TB"};
+    constexpr std::array<std::string_view, 6> units{"B", "KiB", "MiB", "GiB", "TiB", "PiB"};
     double value = static_cast<double>(bytes);
-    std::size_t unit = 0;
+    std::size_t unit{};
     while (value >= 1024.0 && unit + 1 < units.size())
     {
         value /= 1024.0;
         ++unit;
     }
-
     std::ostringstream output;
-    output << std::fixed << std::setprecision(unit == 0 ? 0 : 2) << value << units[unit];
+    output << std::fixed << std::setprecision(unit == 0 ? 0 : 2) << value << ' ' << units[unit];
     return output.str();
 }
-
-HashDigests compute_file_hashes(const std::filesystem::path &file_path)
-{
-    return HashDigests{
-        .md5_hex = digest_to_hex(file_path, EVP_md5()),
-        .sha1_hex = digest_to_hex(file_path, EVP_sha1()),
-    };
-}
-
-std::uint64_t unix_time_milliseconds_now()
-{
-    const auto now = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
-    return static_cast<std::uint64_t>(now.time_since_epoch().count());
-}
-
 std::vector<std::string> split_remote_path(std::string_view remote_path)
 {
     std::string normalized(remote_path);
-    std::ranges::replace(normalized, '\\', '/');
-    if (!normalized.empty() && normalized.front() == '/')
+    std::replace(normalized.begin(), normalized.end(), '\\', '/');
+    std::stringstream input(normalized);
+    std::vector<std::string> result;
+    std::string part;
+    while (std::getline(input, part, '/'))
     {
-        normalized.erase(normalized.begin());
+        if (part == "." || part == "..")
+            throw QuarkException("Remote paths cannot contain . or .. segments");
+        if (!part.empty())
+            result.push_back(part);
     }
-    if (!normalized.empty() && normalized.back() == '/')
-    {
-        normalized.pop_back();
-    }
-
-    std::vector<std::string> segments;
-    std::stringstream stream(normalized);
-    std::string segment;
-    while (std::getline(stream, segment, '/'))
-    {
-        if (!segment.empty())
-        {
-            segments.push_back(segment);
-        }
-    }
-    return segments;
+    return result;
 }
-
+std::filesystem::path path_from_utf8(std::string_view value)
+{
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t *>(value.data()), value.size()));
+}
+std::string path_to_utf8(const std::filesystem::path &value)
+{
+    const auto utf8 = value.u8string();
+    return std::string(reinterpret_cast<const char *>(utf8.data()), utf8.size());
+}
 } // namespace quarkpp

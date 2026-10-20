@@ -2,6 +2,7 @@
 /.xmake-global/
 /.install-test/
 /build/
+/dist/
 /downloads/
 /config/*.local.json
 /config/*.secret.json
@@ -14,3 +15,5 @@
 *.tmp
 *.user
 Thumbs.db
+__pycache__/
+*.pyc

@@ -1,787 +1,435 @@
-#include "quark_client.h"
+#include "login.hpp"
+#include "webdav.hpp"
+#include <quarkpp/client.hpp>
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
 #include <cstdlib>
-#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <memory>
 #include <optional>
-#include <ranges>
 #include <string>
-#include <string_view>
 #include <vector>
 
-#if defined(_WIN32)
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <Windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#elif defined(__linux__)
-#include <unistd.h>
+#include <windows.h>
 #endif
 
 namespace quarkpp
 {
-
-using ArgList = std::vector<std::string>;
-
 namespace
 {
+using Arguments = std::vector<std::string>;
 
-bool g_use_color = true;
-bool g_use_icons = true;
-
-[[nodiscard]] std::optional<std::string> getenv_string(const char *name);
-
-#if defined(_WIN32)
-[[nodiscard]] std::string wide_to_utf8(std::wstring_view value)
+std::optional<std::string> environment(const char *name)
 {
-    if (value.empty())
-    {
-        return {};
-    }
-
-    const auto size =
-        WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    if (size <= 0)
-    {
-        throw QuarkException("宽字符转 UTF-8 失败");
-    }
-
-    std::string result(static_cast<std::size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size, nullptr,
-                        nullptr);
-    return result;
-}
-#endif
-
-[[nodiscard]] std::optional<std::filesystem::path> executable_path()
-{
-#if defined(_WIN32)
-    std::wstring buffer(MAX_PATH, L'\0');
-    for (;;)
-    {
-        const auto length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-        if (length == 0)
-        {
-            return std::nullopt;
-        }
-        if (length < buffer.size())
-        {
-            buffer.resize(length);
-            return std::filesystem::path(buffer);
-        }
-        buffer.resize(buffer.size() * 2);
-    }
-#elif defined(__APPLE__)
-    std::uint32_t size = 0;
-    _NSGetExecutablePath(nullptr, &size);
-    std::string buffer(size, '\0');
-    if (_NSGetExecutablePath(buffer.data(), &size) != 0)
-    {
-        return std::nullopt;
-    }
-    return std::filesystem::weakly_canonical(std::filesystem::path(buffer.c_str()));
-#elif defined(__linux__)
-    std::vector<char> buffer(1024, '\0');
-    for (;;)
-    {
-        const auto length = readlink("/proc/self/exe", buffer.data(), buffer.size());
-        if (length < 0)
-        {
-            return std::nullopt;
-        }
-        if (static_cast<std::size_t>(length) < buffer.size())
-        {
-            return std::filesystem::path(std::string(buffer.data(), static_cast<std::size_t>(length)));
-        }
-        buffer.resize(buffer.size() * 2);
-    }
-#else
-    return std::nullopt;
-#endif
-}
-
-[[nodiscard]] std::optional<std::filesystem::path> find_upwards(const std::filesystem::path &start,
-                                                                const std::filesystem::path &relative)
-{
-    auto current = std::filesystem::weakly_canonical(start);
-    for (;;)
-    {
-        const auto candidate = current / relative;
-        if (std::filesystem::exists(candidate))
-        {
-            return candidate;
-        }
-        const auto parent = current.parent_path();
-        if (parent.empty() || parent == current)
-        {
-            break;
-        }
-        current = parent;
-    }
-    return std::nullopt;
-}
-
-[[nodiscard]] std::optional<std::filesystem::path> project_root()
-{
-    if (const auto found = find_upwards(std::filesystem::current_path(), "xmake.lua"))
-    {
-        return found->parent_path();
-    }
-
-    if (const auto exe = executable_path())
-    {
-        if (const auto found = find_upwards(exe->parent_path(), "xmake.lua"))
-        {
-            return found->parent_path();
-        }
-    }
-
-    return std::nullopt;
-}
-
-[[nodiscard]] std::filesystem::path preferred_working_directory()
-{
-    if (const auto root = project_root())
-    {
-        return *root;
-    }
-    return std::filesystem::current_path();
-}
-
-[[nodiscard]] std::filesystem::path resolve_user_path(std::string_view raw_path)
-{
-    const auto requested = path_from_utf8(raw_path);
-    if (requested.is_absolute())
-    {
-        return requested;
-    }
-
-    const auto current_candidate = std::filesystem::current_path() / requested;
-    if (std::filesystem::exists(current_candidate))
-    {
-        return current_candidate;
-    }
-
-    return preferred_working_directory() / requested;
-}
-
-[[nodiscard]] std::filesystem::path resolve_config_path(const std::optional<std::string> &explicit_path)
-{
-    const auto requested =
-        path_from_utf8(explicit_path.value_or(getenv_string("QUARKPP_CONFIG").value_or("config/quarkpp.local.json")));
-    if (requested.is_absolute() || explicit_path || getenv_string("QUARKPP_CONFIG"))
-    {
-        return requested;
-    }
-
-    if (std::filesystem::exists(requested))
-    {
-        return requested;
-    }
-
-    if (const auto found = find_upwards(std::filesystem::current_path(), requested))
-    {
-        return *found;
-    }
-
-    if (const auto exe = executable_path())
-    {
-        if (const auto found = find_upwards(exe->parent_path(), requested))
-        {
-            return *found;
-        }
-    }
-
-    return requested;
-}
-
-void enable_virtual_terminal()
-{
-#if defined(_WIN32)
-    auto enable_for = [](DWORD handle_id) {
-        const auto handle = GetStdHandle(handle_id);
-        if (handle == INVALID_HANDLE_VALUE || handle == nullptr)
-        {
-            return;
-        }
-        DWORD mode = 0;
-        if (GetConsoleMode(handle, &mode) == 0)
-        {
-            return;
-        }
-        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-    };
-
-    enable_for(STD_OUTPUT_HANDLE);
-    enable_for(STD_ERROR_HANDLE);
-#endif
-}
-
-void init_console_encoding()
-{
-    g_use_color = !getenv_string("NO_COLOR").has_value() && !getenv_string("QUARKPP_NO_COLOR").has_value();
-    g_use_icons = !getenv_string("QUARKPP_NO_ICONS").has_value();
-
-#if defined(_WIN32)
-    SetConsoleCP(CP_UTF8);
-    SetConsoleOutputCP(CP_UTF8);
-    enable_virtual_terminal();
-#endif
-}
-
-#if defined(_WIN32)
-[[nodiscard]] ArgList collect_args(int argc, wchar_t **argv)
-{
-    ArgList args;
-    args.reserve(static_cast<std::size_t>(std::max(0, argc - 1)));
-    for (int index = 1; index < argc; ++index)
-    {
-        args.push_back(wide_to_utf8(argv[index]));
-    }
-    return args;
-}
-#else
-[[nodiscard]] ArgList collect_args(int argc, char **argv)
-{
-    ArgList args;
-    args.reserve(static_cast<std::size_t>(std::max(0, argc - 1)));
-    for (int index = 1; index < argc; ++index)
-    {
-        args.emplace_back(argv[index]);
-    }
-    return args;
-}
-#endif
-
-[[nodiscard]] std::optional<std::string> getenv_string(const char *name)
-{
-#if defined(_WIN32)
+#ifdef _WIN32
     char *value = nullptr;
-    std::size_t length = 0;
-    if (_dupenv_s(&value, &length, name) != 0 || value == nullptr || length == 0)
-    {
+    std::size_t length{};
+    if (_dupenv_s(&value, &length, name) != 0 || !value)
         return std::nullopt;
-    }
-    std::unique_ptr<char, decltype(&std::free)> holder(value, &std::free);
-    return std::string(holder.get());
+    std::string result(value);
+    std::free(value);
+    return result.empty() ? std::nullopt : std::optional(result);
 #else
-    if (const auto *value = std::getenv(name); value != nullptr && *value != '\0')
-    {
-        return std::string(value);
-    }
-    return std::nullopt;
+    const auto *value = std::getenv(name);
+    return value && *value ? std::optional(std::string(value)) : std::nullopt;
 #endif
 }
 
-[[nodiscard]] bool consume_flag(ArgList &args, std::string_view flag)
+bool flag(Arguments &args, const std::string &name)
 {
-    const auto it = std::ranges::find(args, flag);
+    const auto it = std::find(args.begin(), args.end(), name);
     if (it == args.end())
-    {
         return false;
-    }
     args.erase(it);
     return true;
 }
 
-[[nodiscard]] std::optional<std::string> consume_option(ArgList &args, std::string_view name)
+std::optional<std::string> option(Arguments &args, const std::string &name)
 {
-    for (std::size_t index = 0; index < args.size(); ++index)
-    {
-        if (args[index] == name)
-        {
-            if (index + 1 >= args.size())
-            {
-                throw QuarkException("缺少参数值: " + std::string(name));
-            }
-            auto value = args[index + 1];
-            args.erase(args.begin() + static_cast<std::ptrdiff_t>(index),
-                       args.begin() + static_cast<std::ptrdiff_t>(index + 2));
-            return value;
-        }
-    }
-    return std::nullopt;
+    const auto it = std::find(args.begin(), args.end(), name);
+    if (it == args.end())
+        return std::nullopt;
+    if (it + 1 == args.end() || (it + 1)->starts_with("--"))
+        throw QuarkException("Missing value for " + name);
+    auto result = *(it + 1);
+    args.erase(it, it + 2);
+    return result;
 }
 
-[[nodiscard]] std::string require_positional(ArgList &args, std::string_view label)
+std::string positional(Arguments &args, const std::string &name)
 {
-    if (args.empty())
-    {
-        throw QuarkException("缺少参数: " + std::string(label));
-    }
-    auto value = args.front();
+    if (args.empty() || args.front().starts_with("--"))
+        throw QuarkException("Missing " + name);
+    auto result = args.front();
     args.erase(args.begin());
-    return value;
+    return result;
 }
 
-[[nodiscard]] json entry_to_json(const RemoteEntry &entry)
+void exhausted(const Arguments &args)
 {
-    return {
-        {"fid", entry.fid}, {"file_name", entry.name}, {"pdir_fid", entry.parent_fid},
-        {"dir", entry.dir}, {"size", entry.size},
-    };
+    if (!args.empty())
+        throw QuarkException("Unexpected argument: " + args.front());
 }
 
-[[nodiscard]] std::uint32_t next_codepoint(std::string_view text, std::size_t &index)
+unsigned number(const std::string &text, const std::string &label, unsigned minimum = 1, unsigned maximum = 1000000)
 {
-    const auto lead = static_cast<unsigned char>(text[index]);
-    if (lead < 0x80)
-    {
-        ++index;
-        return lead;
-    }
-    if ((lead >> 5) == 0x6 && index + 1 < text.size())
-    {
-        const auto b1 = static_cast<unsigned char>(text[index + 1]);
-        index += 2;
-        return ((lead & 0x1F) << 6) | (b1 & 0x3F);
-    }
-    if ((lead >> 4) == 0xE && index + 2 < text.size())
-    {
-        const auto b1 = static_cast<unsigned char>(text[index + 1]);
-        const auto b2 = static_cast<unsigned char>(text[index + 2]);
-        index += 3;
-        return ((lead & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
-    }
-    if ((lead >> 3) == 0x1E && index + 3 < text.size())
-    {
-        const auto b1 = static_cast<unsigned char>(text[index + 1]);
-        const auto b2 = static_cast<unsigned char>(text[index + 2]);
-        const auto b3 = static_cast<unsigned char>(text[index + 3]);
-        index += 4;
-        return ((lead & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F);
-    }
-    ++index;
-    return 0xFFFD;
+    unsigned result{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), result);
+    if (error != std::errc() || end != text.data() + text.size() || result < minimum || result > maximum)
+        throw QuarkException("Invalid " + label);
+    return result;
 }
 
-[[nodiscard]] int codepoint_width(std::uint32_t cp)
+void help()
 {
-    if (cp == 0 || cp == '\n' || cp == '\r' || cp == '\t')
-    {
-        return 0;
-    }
-    if (cp < 32 || (cp >= 0x7F && cp < 0xA0))
-    {
-        return 0;
-    }
-    if ((cp >= 0x0300 && cp <= 0x036F) || (cp >= 0x1AB0 && cp <= 0x1AFF) || (cp >= 0x1DC0 && cp <= 0x1DFF) ||
-        (cp >= 0x20D0 && cp <= 0x20FF) || (cp >= 0xFE20 && cp <= 0xFE2F))
-    {
-        return 0;
-    }
-    if (cp >= 0x1100 &&
-        (cp <= 0x115F || cp == 0x2329 || cp == 0x232A || (cp >= 0x2E80 && cp <= 0xA4CF && cp != 0x303F) ||
-         (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE10 && cp <= 0xFE19) ||
-         (cp >= 0xFE30 && cp <= 0xFE6F) || (cp >= 0xFF00 && cp <= 0xFF60) || (cp >= 0xFFE0 && cp <= 0xFFE6) ||
-         (cp >= 0x1F300 && cp <= 0x1FAFF) || (cp >= 0x20000 && cp <= 0x3FFFD)))
-    {
-        return 2;
-    }
-    return 1;
+    std::cout << R"(QuarkPlusPlus — a C++20 Quark Drive client
+
+Usage: quarkpp [--config FILE] [--json] COMMAND [OPTIONS]
+
+  login [--timeout SECONDS] [--qr-svg FILE] [--ca-bundle FILE]
+                                    Sign in by scanning a terminal QR code
+  account                           Show account information
+  ls [--fid ID | --path /PATH]       List a directory (default: root)
+  search TEXT [--fid ID | --path /PATH]
+  info --fid ID | --path /PATH       Show an entry
+  mkdir NAME [--parent-fid ID | --parent-path /PATH]
+  rename NAME --fid ID | --path /PATH
+  rm --fid ID | --path /PATH         Move an entry to the drive's recycle bin
+  upload FILE [--to-fid ID | --to-path /PATH] [--name NAME] [--progress]
+  download --fid ID | --path /PATH [--out DIRECTORY] [--no-resume] [--progress]
+  offline parse SOURCE              Preview a magnet or HTTP(S) source
+  offline add SOURCE [--to-fid ID | --to-path /PATH] [--select 0,1]
+  offline list [--page N] [--size N]
+  offline status TASK_ID [--wait]    Inspect or wait for a cloud task
+  serve [--host 127.0.0.1] [--port 8787] [--user quarkpp]
+        [--password PASSWORD] [--read-only] [--temp-dir DIRECTORY]
+  help | --help
+  --version
+
+Configuration defaults to config/quarkpp.local.json in the current directory.
+QUARKPP_CONFIG overrides its path; QUARKPP_COOKIE overrides its cookie.
+Use QUARKPP_WEBDAV_PASSWORD for the local WebDAV password (required).
+The WebDAV bridge supports rclone mount on Windows, Linux, and macOS.
+Uploads through WebDAV spool to temporary disk before uploading to Quark.
+--progress reports current-file transferred/total bytes to stderr once per second.
+)";
 }
 
-[[nodiscard]] std::size_t display_width(std::string_view text)
-{
-    std::size_t width = 0;
-    for (std::size_t index = 0; index < text.size();)
-    {
-        width += static_cast<std::size_t>(codepoint_width(next_codepoint(text, index)));
-    }
-    return width;
-}
-
-[[nodiscard]] std::string style(std::string_view text, std::string_view code)
-{
-    if (!g_use_color || code.empty())
-    {
-        return std::string(text);
-    }
-    return "\x1b[" + std::string(code) + "m" + std::string(text) + "\x1b[0m";
-}
-
-[[nodiscard]] std::string pad_right(std::string text, std::size_t visible, std::size_t target)
-{
-    if (visible >= target)
-    {
-        return text;
-    }
-    text.append(target - visible, ' ');
-    return text;
-}
-
-[[nodiscard]] std::string pad_left(std::string text, std::size_t visible, std::size_t target)
-{
-    if (visible >= target)
-    {
-        return text;
-    }
-    return std::string(target - visible, ' ') + text;
-}
-
-void print_help()
-{
-    std::cout
-        << "QuarkPlusPlus CLI\n\n"
-        << "Usage:\n"
-        << "  quarkpp [--config path] [--json] <command> [options]\n\n"
-        << "Commands:\n"
-        << "  account                              Show account info\n"
-        << "  growth-info                          Show daily growth/sign-in info\n"
-        << "  growth-sign                          Perform daily growth sign-in\n"
-        << "  ls [--fid id | --path /remote]       List a folder, default root\n"
-        << "  search <keyword> [--fid id | --path /remote]\n"
-        << "  info --fid id | --path /remote       Show file/folder info\n"
-        << "  mkdir <name> [--parent-fid id | --parent-path /remote]\n"
-        << "  rename <new-name> --fid id | --path /remote\n"
-        << "  rm --fid id | --path /remote         Delete a file/folder\n"
-        << "  share-create --fid id | --path /remote [--title t] [--expire permanent|1d|7d|30d] [--passcode code]\n"
-        << "  share-list [--page n] [--size n]\n"
-        << "  transfer <share-url> [--passcode code] [--to-fid id | --to-path /remote]\n"
-        << "  upload <local-file> [--to-fid id | --to-path /remote] [--name remote-name]\n"
-        << "  download --fid id | --path /remote [--out dir] [--no-resume]\n\n"
-        << "Configuration:\n"
-        << "  Default config path: config/quarkpp.local.json\n"
-        << "  Ignored example path: config/quarkpp.example.json\n"
-        << "  Environment overrides: QUARKPP_CONFIG, QUARKPP_COOKIE\n"
-        << "  Output toggles: NO_COLOR, QUARKPP_NO_COLOR, QUARKPP_NO_ICONS\n";
-}
-
-[[nodiscard]] AppConfig load_config(const std::optional<std::string> &config_path_override)
+AppConfig load_config(const std::optional<std::string> &explicit_path)
 {
     AppConfig config;
-    const auto config_path = resolve_config_path(config_path_override);
-
-    if (std::filesystem::exists(config_path))
+    const auto env_path = environment("QUARKPP_CONFIG");
+    const auto path = path_from_utf8(explicit_path.value_or(env_path.value_or("config/quarkpp.local.json")));
+    if (std::filesystem::exists(path))
     {
-        std::ifstream input(config_path);
+        std::ifstream input(path);
         if (!input)
+            throw QuarkException("Cannot read configuration file");
+        json data;
+        try
         {
-            throw QuarkException("无法打开配置文件: " + path_to_utf8(config_path));
+            data = json::parse(input);
         }
-        json file_config = json::parse(input);
-        config.cookie = file_config.value("cookie", "");
-        config.user_agent = file_config.value("user_agent", "");
-        config.download_dir = resolve_user_path(file_config.value("download_dir", "downloads"));
-        config.request_timeout_ms = file_config.value("request_timeout_ms", 120000U);
-        config.upload_retry_count = file_config.value("upload_retry_count", 3);
+        catch (const json::parse_error &)
+        {
+            throw QuarkException("Invalid JSON configuration file");
+        }
+        config.cookie = data.value("cookie", "");
+        config.user_agent = data.value("user_agent", "");
+        config.download_dir = path_from_utf8(data.value("download_dir", "downloads"));
+        config.request_timeout_ms = data.value("request_timeout_ms", 120000U);
+        config.upload_retry_count = data.value("upload_retry_count", 3);
+        config.download_retry_count = data.value("download_retry_count", 3);
+        config.task_poll_limit = data.value("task_poll_limit", 30U);
+        config.ca_bundle = data.value("ca_bundle", "");
+        config.api_base = data.value("api_base", config.api_base);
+        config.offline_api_base = data.value("offline_api_base", config.offline_api_base);
+        config.upload_base = data.value("upload_base", config.upload_base);
+        const auto secure_number =
+            data.value("offline_secure_number", static_cast<unsigned>(config.offline_secure_number));
+        if (secure_number > 65535)
+            throw QuarkException("offline_secure_number exceeds 16 bits");
+        config.offline_secure_number = static_cast<std::uint16_t>(secure_number);
+        config.offline_key = data.value("offline_key", config.offline_key);
     }
-    else
-    {
-        config.download_dir = preferred_working_directory() / config.download_dir;
-    }
-
-    if (const auto cookie = getenv_string("QUARKPP_COOKIE"))
-    {
+    else if (explicit_path || env_path)
+        throw QuarkException("Configuration file does not exist");
+    if (const auto cookie = environment("QUARKPP_COOKIE"))
         config.cookie = *cookie;
-    }
     return config;
 }
 
-[[nodiscard]] std::string resolve_fid(QuarkClient &client, ArgList &args,
-                                      std::optional<std::string> default_fid = std::nullopt,
-                                      std::string_view fid_flag = "--fid", std::string_view path_flag = "--path")
+std::string fid(QuarkClient &client, Arguments &args, std::optional<std::string> fallback = {},
+                const std::string &id_flag = "--fid", const std::string &path_flag = "--path")
 {
-    if (const auto fid = consume_option(args, fid_flag))
-    {
-        return *fid;
-    }
-    if (const auto path = consume_option(args, path_flag))
-    {
+    const auto id = option(args, id_flag);
+    const auto path = option(args, path_flag);
+    if (id && path)
+        throw QuarkException("Choose either " + id_flag + " or " + path_flag);
+    if (id)
+        return *id;
+    if (path)
         return client.resolve_path(*path).fid;
-    }
-    if (default_fid)
-    {
-        return *default_fid;
-    }
-    throw QuarkException("需要提供 --fid 或 --path");
+    if (fallback)
+        return *fallback;
+    throw QuarkException("Specify " + id_flag + " or " + path_flag);
 }
 
-[[nodiscard]] int parse_expire_type(const std::optional<std::string> &raw)
+json entry_json(const RemoteEntry &entry)
 {
-    if (!raw || raw->empty() || *raw == "permanent")
-    {
-        return 1;
-    }
-    if (*raw == "1d")
-    {
-        return 2;
-    }
-    if (*raw == "7d")
-    {
-        return 3;
-    }
-    if (*raw == "30d")
-    {
-        return 4;
-    }
-    throw QuarkException("无效的过期时间，请使用 permanent|1d|7d|30d");
+    return {{"fid", entry.fid},
+            {"name", entry.name},
+            {"parent_fid", entry.parent_fid},
+            {"size", entry.size},
+            {"dir", entry.dir}};
 }
 
-void print_entries(const std::vector<RemoteEntry> &entries)
+void print_entries(const std::vector<RemoteEntry> &entries, bool as_json)
 {
-    struct Row
+    if (as_json)
     {
-        std::string type_plain;
-        std::string size_plain;
-        std::string fid_plain;
-        std::string name_plain;
-        std::string type_render;
-        std::string size_render;
-        std::string fid_render;
-        std::string name_render;
-    };
-
-    std::vector<Row> rows;
-    rows.reserve(entries.size());
-
-    std::size_t type_width = display_width("TYPE");
-    std::size_t size_width = display_width("SIZE");
-    std::size_t fid_width = display_width("FID");
-
-    for (const auto &entry : entries)
-    {
-        const auto icon = g_use_icons ? (entry.dir ? "󰉋 " : "󰈔 ") : "";
-        const auto type_plain = entry.dir ? "dir" : "file";
-        const auto size_plain = entry.dir ? std::string("-") : format_bytes(entry.size);
-        const auto fid_plain = entry.fid;
-        const auto name_plain = std::string(icon) + entry.name;
-
-        type_width = std::max(type_width, display_width(type_plain));
-        size_width = std::max(size_width, display_width(size_plain));
-        fid_width = std::max(fid_width, display_width(fid_plain));
-
-        rows.push_back(Row{
-            .type_plain = type_plain,
-            .size_plain = size_plain,
-            .fid_plain = fid_plain,
-            .name_plain = name_plain,
-            .type_render = style(type_plain, entry.dir ? "1;36" : "1;32"),
-            .size_render = style(size_plain, entry.dir ? "2" : "33"),
-            .fid_render = style(fid_plain, "2"),
-            .name_render = style(name_plain, entry.dir ? "1;36" : "0"),
-        });
-    }
-
-    const auto header_type = pad_right(style("TYPE", "1"), display_width("TYPE"), type_width);
-    const auto header_size = pad_left(style("SIZE", "1"), display_width("SIZE"), size_width);
-    const auto header_fid = pad_right(style("FID", "1"), display_width("FID"), fid_width);
-    const auto header_name = style("NAME", "1");
-
-    std::cout << header_type << "  " << header_size << "  " << header_fid << "  " << header_name << '\n';
-
-    for (const auto &row : rows)
-    {
-        std::cout << pad_right(row.type_render, display_width(row.type_plain), type_width) << "  "
-                  << pad_left(row.size_render, display_width(row.size_plain), size_width) << "  "
-                  << pad_right(row.fid_render, display_width(row.fid_plain), fid_width) << "  " << row.name_render
-                  << '\n';
-    }
-}
-
-void print_json_or_entries(const std::vector<RemoteEntry> &entries, bool json_output)
-{
-    if (json_output)
-    {
-        json output = json::array();
+        auto output = json::array();
         for (const auto &entry : entries)
-        {
-            output.push_back(entry_to_json(entry));
-        }
+            output.push_back(entry_json(entry));
         std::cout << output.dump(2) << '\n';
         return;
     }
-    print_entries(entries);
+    std::cout << "TYPE  SIZE          FID                               NAME\n";
+    for (const auto &entry : entries)
+        std::cout << std::left << std::setw(6) << (entry.dir ? "dir" : "file") << std::setw(14)
+                  << (entry.dir ? "-" : format_bytes(entry.size)) << std::setw(34) << entry.fid << entry.name << '\n';
 }
 
-void print_json_or_value(const json &value, bool json_output)
+void print(const json &value)
 {
-    if (json_output)
-    {
-        std::cout << value.dump(2) << '\n';
-        return;
-    }
     std::cout << value.dump(2) << '\n';
 }
 
-} // namespace
-
-int run_app(ArgList args)
+class TransferProgress
 {
-    init_console_encoding();
-
-    const bool json_output = consume_flag(args, "--json");
-    const auto config_path = consume_option(args, "--config");
-
-    if (args.empty() || consume_flag(args, "--help") || consume_flag(args, "-h") || args.front() == "help")
+  public:
+    TransferProgress(bool enabled, std::string operation) : enabled_(enabled), operation_(std::move(operation))
     {
-        print_help();
-        return 0;
     }
 
-    const auto command = require_positional(args, "command");
-    auto client = QuarkClient(load_config(config_path));
+    ProgressCallback callback()
+    {
+        if (!enabled_)
+            return {};
+        return [this](std::uint64_t transferred, std::uint64_t total)
+        {
+            transferred_ = transferred;
+            total_ = total;
+            const auto now = std::chrono::steady_clock::now();
+            // Completion is printed only after the operation itself succeeds.
+            if (transferred == total || (reported_ && now - last_ < std::chrono::seconds(1)))
+                return;
+            std::cerr << operation_ << ": " << transferred_ << '/' << total_ << " bytes\n";
+            last_ = now;
+            reported_ = true;
+        };
+    }
 
+    void finish() const
+    {
+        if (enabled_)
+            std::cerr << operation_ << ": complete " << transferred_ << '/' << total_ << " bytes\n";
+    }
+
+  private:
+    bool enabled_;
+    std::string operation_;
+    bool reported_{false};
+    std::uint64_t transferred_{};
+    std::uint64_t total_{};
+    std::chrono::steady_clock::time_point last_{};
+};
+
+int run(Arguments args)
+{
+    const auto config_path = option(args, "--config");
+    const auto as_json = flag(args, "--json");
+    if (args.empty() || flag(args, "--help") || flag(args, "-h") || args.front() == "help")
+    {
+        help();
+        return 0;
+    }
+    if (flag(args, "--version"))
+    {
+        exhausted(args);
+        std::cout << "QuarkPlusPlus 0.2.0\n";
+        return 0;
+    }
+    const auto command = positional(args, "command");
+    if (command == "login")
+    {
+        cli::LoginOptions options;
+        options.timeout_seconds = number(option(args, "--timeout").value_or("300"), "login timeout", 1, 300);
+        if (const auto svg = option(args, "--qr-svg"))
+            options.qr_svg_path = path_from_utf8(*svg);
+        options.ca_bundle = option(args, "--ca-bundle").value_or("");
+        exhausted(args);
+        const auto destination =
+            path_from_utf8(config_path.value_or(environment("QUARKPP_CONFIG").value_or("config/quarkpp.local.json")));
+        return cli::run_login(destination, options);
+    }
+    QuarkClient client(load_config(config_path));
     if (command == "account")
     {
-        print_json_or_value(client.account_info(), json_output);
-        return 0;
+        exhausted(args);
+        print(client.account_info());
     }
-
-    if (command == "growth-info")
+    else if (command == "ls" || command == "search")
     {
-        print_json_or_value(client.growth_info(), json_output);
-        return 0;
+        const auto keyword = command == "search" ? positional(args, "search text") : std::string{};
+        const auto id = fid(client, args, "0");
+        exhausted(args);
+        print_entries(command == "ls" ? client.list_directory(id) : client.search(keyword, id), as_json);
     }
-
-    if (command == "growth-sign")
+    else if (command == "info" || command == "rm")
     {
-        print_json_or_value(client.growth_sign(), json_output);
-        return 0;
+        const auto id = fid(client, args);
+        exhausted(args);
+        print(command == "info" ? entry_json(client.file_info(id)) : client.delete_items({id}));
     }
-
-    if (command == "ls")
+    else if (command == "mkdir" || command == "rename")
     {
-        const auto fid = resolve_fid(client, args, std::string("0"));
-        print_json_or_entries(client.list_directory(fid), json_output);
-        return 0;
+        const auto name = positional(args, "name");
+        const auto id =
+            command == "mkdir" ? fid(client, args, "0", "--parent-fid", "--parent-path") : fid(client, args);
+        exhausted(args);
+        print(command == "mkdir" ? client.create_folder(id, name) : client.rename(id, name));
     }
-
-    if (command == "search")
+    else if (command == "upload")
     {
-        const auto keyword = require_positional(args, "keyword");
-        const auto fid = resolve_fid(client, args, std::string("0"));
-        print_json_or_entries(client.search(keyword, fid), json_output);
-        return 0;
+        const auto local = path_from_utf8(positional(args, "local file"));
+        const auto id = fid(client, args, "0", "--to-fid", "--to-path");
+        const auto name = option(args, "--name");
+        TransferProgress progress(flag(args, "--progress"), "upload");
+        exhausted(args);
+        const auto result = client.upload_file(local, id, name, progress.callback());
+        progress.finish();
+        print({{"fid", result.fid},
+               {"name", result.file_name},
+               {"size", result.size},
+               {"fast_upload", result.fast_upload}});
     }
-
-    if (command == "info")
+    else if (command == "download")
     {
-        const auto fid = resolve_fid(client, args);
-        print_json_or_value(entry_to_json(client.file_info(fid)), json_output);
-        return 0;
+        const auto id = fid(client, args);
+        const auto output = option(args, "--out");
+        const auto resume = !flag(args, "--no-resume");
+        TransferProgress progress(flag(args, "--progress"), "download");
+        exhausted(args);
+        const auto destination = output ? path_from_utf8(*output) : client.config().download_dir;
+        client.download(id, destination, resume, progress.callback());
+        progress.finish();
+        print({{"status", "ok"}, {"output", path_to_utf8(destination)}});
     }
-
-    if (command == "mkdir")
+    else if (command == "offline")
     {
-        const auto name = require_positional(args, "name");
-        const auto parent_fid = resolve_fid(client, args, std::string("0"), "--parent-fid", "--parent-path");
-        print_json_or_value(client.create_folder(parent_fid, name), json_output);
-        return 0;
-    }
-
-    if (command == "rename")
-    {
-        const auto new_name = require_positional(args, "new-name");
-        const auto fid = resolve_fid(client, args);
-        print_json_or_value(client.rename(fid, new_name), json_output);
-        return 0;
-    }
-
-    if (command == "rm")
-    {
-        const auto fid = resolve_fid(client, args);
-        print_json_or_value(client.delete_items({fid}), json_output);
-        return 0;
-    }
-
-    if (command == "share-create")
-    {
-        const auto fid = resolve_fid(client, args);
-        const auto title = consume_option(args, "--title").value_or(client.file_info(fid).name);
-        const auto expire_type = parse_expire_type(consume_option(args, "--expire"));
-        const auto passcode = consume_option(args, "--passcode");
-        print_json_or_value(client.share_create({fid}, title, expire_type, 1, passcode), json_output);
-        return 0;
-    }
-
-    if (command == "share-list")
-    {
-        const auto page = consume_option(args, "--page").value_or("1");
-        const auto size = consume_option(args, "--size").value_or("50");
-        print_json_or_value(client.share_list(std::stoi(page), std::stoi(size)), json_output);
-        return 0;
-    }
-
-    if (command == "transfer")
-    {
-        const auto share_url = require_positional(args, "share-url");
-        const auto passcode = consume_option(args, "--passcode");
-        const auto target_fid = resolve_fid(client, args, std::string("0"), "--to-fid", "--to-path");
-        print_json_or_value(client.transfer_share(share_url, target_fid, passcode), json_output);
-        return 0;
-    }
-
-    if (command == "upload")
-    {
-        const auto local_file = require_positional(args, "local-file");
-        const auto target_fid = resolve_fid(client, args, std::string("0"), "--to-fid", "--to-path");
-        const auto remote_name = consume_option(args, "--name");
-        const auto result = client.upload_file(resolve_user_path(local_file), target_fid, remote_name);
-        json output{
-            {"fid", result.fid},
-            {"file_name", result.file_name},
-            {"size", result.size},
-            {"fast_upload", result.fast_upload},
-        };
-        print_json_or_value(output, json_output);
-        return 0;
-    }
-
-    if (command == "download")
-    {
-        const auto fid = resolve_fid(client, args);
-        const auto out_dir = consume_option(args, "--out");
-        const bool resume = !consume_flag(args, "--no-resume");
-        const auto output_dir = out_dir ? resolve_user_path(*out_dir) : client.config().download_dir;
-        client.download(fid, output_dir, resume);
-        if (json_output)
+        const auto action = positional(args, "offline action");
+        if (action == "parse")
         {
-            std::cout << json{{"status", "ok"}, {"output", path_to_utf8(output_dir)}}.dump(2) << '\n';
+            const auto source = positional(args, "source");
+            exhausted(args);
+            print(client.offline_parse(source));
         }
-        return 0;
+        else if (action == "add")
+        {
+            const auto source = positional(args, "source");
+            const auto id = fid(client, args, "0", "--to-fid", "--to-path");
+            const auto select = option(args, "--select");
+            exhausted(args);
+            std::vector<int> selected;
+            if (select)
+            {
+                std::size_t start{};
+                do
+                {
+                    const auto end = select->find(',', start);
+                    selected.push_back(static_cast<int>(number(select->substr(start, end - start), "file index", 0)));
+                    if (end == std::string::npos)
+                        break;
+                    start = end + 1;
+                } while (true);
+            }
+            print(client.offline_add(source, id, selected));
+        }
+        else if (action == "list")
+        {
+            const auto page = number(option(args, "--page").value_or("1"), "page");
+            const auto size = number(option(args, "--size").value_or("50"), "page size", 1, 100);
+            exhausted(args);
+            print(client.offline_tasks(page, size));
+        }
+        else if (action == "status")
+        {
+            const auto task = positional(args, "task id");
+            const auto wait = flag(args, "--wait");
+            exhausted(args);
+            print(wait ? client.wait_task(task) : client.task_status(task));
+        }
+        else
+            throw QuarkException("Unknown offline action: " + action);
     }
-
-    throw QuarkException("未知命令: " + command);
+    else if (command == "serve")
+    {
+        WebDavOptions options;
+        options.host = option(args, "--host").value_or("127.0.0.1");
+        options.port = static_cast<int>(number(option(args, "--port").value_or("8787"), "port", 1, 65535));
+        options.username = option(args, "--user").value_or("quarkpp");
+        options.password = option(args, "--password").value_or(environment("QUARKPP_WEBDAV_PASSWORD").value_or(""));
+        options.read_only = flag(args, "--read-only");
+        if (const auto path = option(args, "--temp-dir"))
+            options.temp_directory = path_from_utf8(*path);
+        exhausted(args);
+        WebDavServer server(client, options);
+        const auto port = server.bind();
+        const auto host = options.host == "::1" ? "[::1]" : options.host;
+        std::cout << "WebDAV listening on http://" << host << ':' << port << "/ ("
+                  << (options.read_only ? "read only" : "read/write") << ")\n"
+                  << "Username: " << options.username << "; password: supplied separately. Press Ctrl+C to stop.\n"
+                  << std::flush;
+        if (!server.listen())
+            throw QuarkException("WebDAV server stopped unexpectedly");
+    }
+    else
+        throw QuarkException("Unknown command: " + command + ". Use --help for usage.");
+    return 0;
 }
-
+} // namespace
 } // namespace quarkpp
 
-#if defined(_WIN32)
+#ifdef _WIN32
 int wmain(int argc, wchar_t **argv)
 {
-    try
+    SetConsoleOutputCP(CP_UTF8);
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; ++i)
     {
-        return quarkpp::run_app(quarkpp::collect_args(argc, argv));
+        const int length = WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string value(static_cast<std::size_t>(length), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, value.data(), length, nullptr, nullptr);
+        if (!value.empty())
+            value.pop_back();
+        args.push_back(std::move(value));
     }
-    catch (const quarkpp::QuarkException &error)
-    {
-        std::cerr << "error: " << error.what() << '\n';
-        return 1;
-    }
-    catch (const std::exception &error)
-    {
-        std::cerr << "error: " << error.what() << '\n';
-        return 1;
-    }
-}
 #else
 int main(int argc, char **argv)
 {
+    std::vector<std::string> args(argv + 1, argv + argc);
+#endif
     try
     {
-        return quarkpp::run_app(quarkpp::collect_args(argc, argv));
-    }
-    catch (const quarkpp::QuarkException &error)
-    {
-        std::cerr << "error: " << error.what() << '\n';
-        return 1;
+        return quarkpp::run(std::move(args));
     }
     catch (const std::exception &error)
     {
@@ -789,4 +437,3 @@ int main(int argc, char **argv)
         return 1;
     }
 }
-#endif
