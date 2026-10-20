@@ -8,6 +8,7 @@ A reusable C++20 library, a focused command-line client, and a local WebDAV brid
 
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
 ![Build](https://img.shields.io/badge/build-xmake-22A079)
+[![CI](https://github.com/TabNahida/QuarkPlusPlus/actions/workflows/build.yml/badge.svg)](https://github.com/TabNahida/QuarkPlusPlus/actions/workflows/build.yml)
 ![HTTP](https://img.shields.io/badge/HTTP-cpp--httplib-455A64)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 
@@ -35,6 +36,8 @@ This is an **unofficial client** using Quark's private web APIs. Account privile
 
 ## Quick start
 
+Get a prebuilt CLI and SDK from [Releases](https://github.com/TabNahida/QuarkPlusPlus/releases): Windows x64, Linux x64, macOS Intel, and macOS Apple Silicon. Extract the archive, add its `bin` directory to `PATH`, and run `quarkpp login`. Checksums and platform requirements accompany each release. To build from source:
+
 Use a **64-bit C++20 toolchain**: Visual Studio 2022 or newer on Windows, GCC 13+/Clang 16+ with a C++20 standard library on Linux, or a recent Xcode Command Line Tools on macOS. Install [xmake](https://xmake.io/guide/quick-start), then:
 
 ```sh
@@ -52,6 +55,8 @@ xmake run quarkpp login
 ```
 
 Scan the displayed QR code with the Quark mobile app and confirm sign-in. The CLI saves the session to `config/quarkpp.local.json`, preserving your other settings. This file is ignored by Git. Run `login` again when your session expires. You can also supply an existing Quark web session cookie through `QUARKPP_COOKIE` or [the example config](config/quarkpp.example.json).
+
+If your terminal cannot render the code clearly, add `--qr-svg login.svg` and open the local image. QR codes expire after five minutes; `--timeout SECONDS` can shorten the wait. `--ca-bundle FILE` supplies a custom PEM certificate bundle for sign-in.
 
 ```json
 {
@@ -162,6 +167,8 @@ Keep both processes running; stop the mount before stopping the bridge. See [mou
 WebDAV reads stream directly from Quark. Writes need **temporary disk space for the whole file**, in addition to rclone's VFS cache; `--temp-dir` chooses an existing staging directory. Cloud replacement is not atomic. The bridge supports listing, GET/HEAD with one byte range, PUT, MKCOL, DELETE, and same-directory MOVE. It does not implement COPY, LOCK, PROPPATCH, or POSIX filesystem semantics. rclone is the documented mount client; native Windows WebClient and Finder mounts are not validated.
 
 ## Use the library
+
+The authentication API in [auth.hpp](include/quarkpp/auth.hpp) is independent of the CLI: `QrLoginClient::start()` returns the official QR URL, and `poll()` returns the login state and, after confirmation, the session cookie. Applications handle display and credential storage themselves.
 
 ```cpp
 #include <quarkpp/client.hpp>

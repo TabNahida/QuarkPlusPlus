@@ -33,10 +33,12 @@ jobs:
             platform: macos
             arch: x64
             xmake_arch: x86_64
+            configure_args: --target_minver=15.0
           - runner: macos-15
             platform: macos
             arch: arm64
             xmake_arch: arm64
+            configure_args: --target_minver=15.0
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -47,8 +49,9 @@ jobs:
       - uses: xmake-io/github-action-setup-xmake@v1
         with:
           xmake-version: '3.0.9'
+          package-cache: true
       - name: Configure
-        run: xmake f -m release -a ${{ matrix.xmake_arch }} --tests=y -y
+        run: xmake f -m release -a ${{ matrix.xmake_arch }} ${{ matrix.configure_args }} --tests=y -y
       - name: Build CLI and library
         run: xmake -y
       - name: Run offline integration tests

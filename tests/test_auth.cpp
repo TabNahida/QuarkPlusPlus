@@ -140,7 +140,18 @@ int main()
                             redirect_cookie = cookie.find("__pus=pus-secret") != std::string::npos &&
                                               cookie.find("__uid=uid-secret") != std::string::npos;
                             response.set_header("Set-Cookie", "remove_me=deleted; Path=/; Max-Age=0");
-                            reply(response, {{"success", true}, {"data", {}}});
+                            json code = "OK";
+                            if (mode == 9)
+                                code = 0;
+                            else if (mode == 10)
+                                code = "DENIED-secret-value";
+                            else if (mode == 11)
+                                code = nullptr;
+                            else if (mode == 12)
+                                code = 0.0;
+                            else if (mode == 13)
+                                code = true;
+                            reply(response, {{"success", mode != 14}, {"code", code}, {"data", {}}});
                         });
         server.http.Get("/1/clouddrive/config",
                         [&](const auto &request, auto &response)
@@ -218,6 +229,18 @@ int main()
         mode = 8;
         static_cast<void>(login.start());
         static_cast<void>(fails([&] { static_cast<void>(login.poll()); }, "incomplete credentials must fail"));
+        mode = 9;
+        static_cast<void>(login.start());
+        check(login.poll().status == QrLoginStatus::authenticated, "numeric zero exchange code is also accepted");
+        for (int invalid = 10; invalid <= 14; ++invalid)
+        {
+            mode = invalid;
+            const auto previous_configurations = configurations.load();
+            static_cast<void>(login.start());
+            error = fails([&] { static_cast<void>(login.poll()); }, "invalid ticket exchange result must fail");
+            check(error.find("secret-value") == std::string::npos && configurations == previous_configurations,
+                  "rejected exchange is sanitized and never used for drive authentication");
+        }
         mode = 0;
         auto options = server.options();
         options.login_timeout_seconds = 1;

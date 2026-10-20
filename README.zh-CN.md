@@ -8,6 +8,7 @@
 
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
 ![Build](https://img.shields.io/badge/build-xmake-22A079)
+[![CI](https://github.com/TabNahida/QuarkPlusPlus/actions/workflows/build.yml/badge.svg)](https://github.com/TabNahida/QuarkPlusPlus/actions/workflows/build.yml)
 ![HTTP](https://img.shields.io/badge/HTTP-cpp--httplib-455A64)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 
@@ -35,6 +36,8 @@
 
 ## 快速开始
 
+可从 [Releases](https://github.com/TabNahida/QuarkPlusPlus/releases) 下载 Windows x64、Linux x64、macOS Intel 或 Apple Silicon 的预编译客户端和 SDK。解压后将 `bin` 加入 `PATH`，运行 `quarkpp login`；每个版本附有校验和及系统要求。从源码构建请继续：
+
 准备 **64 位 C++20 编译器**：Windows 使用 Visual Studio 2022 或更新版本；Linux 使用 GCC 13+/Clang 16+，并配备支持 C++20 的标准库；macOS 使用较新的 Xcode Command Line Tools。安装 [xmake](https://xmake.io/guide/quick-start)，然后运行：
 
 ```sh
@@ -52,6 +55,8 @@ xmake run quarkpp login
 ```
 
 使用夸克手机 App 扫描二维码并确认登录。CLI 会把会话保存到 `config/quarkpp.local.json`，保留其他配置项；该文件已加入 Git 忽略列表。会话过期后重新执行 `login` 即可。也兼容通过 `QUARKPP_COOKIE` 或[配置示例](config/quarkpp.example.json)手动提供已有 Cookie。
+
+若终端显示不清晰，可添加 `--qr-svg login.svg` 并打开本地图片扫码。二维码有效期为五分钟；`--timeout SECONDS` 可缩短等待时间，`--ca-bundle FILE` 可为登录配置自定义 PEM 证书包。
 
 ```json
 {
@@ -161,6 +166,8 @@ rclone mount quark: "$HOME/Quark" --vfs-cache-mode full --timeout 1h
 读取会直接从夸克流式传输。写入需先保存完整文件到临时磁盘，**临时磁盘空间需要容纳整个文件**，此外还有 rclone VFS 缓存；可用 `--temp-dir` 指定已有目录。覆盖远端文件不是原子操作。桥接支持目录列表、GET/HEAD 单段 Range、PUT、MKCOL、DELETE、同目录 MOVE；不支持 COPY、LOCK、PROPPATCH，也不具备完整 POSIX 语义。文档以 rclone 为挂载客户端，Windows 原生 WebClient 和 Finder 挂载未验证。
 
 ## 接入 C++ 接口库
+
+[auth.hpp](include/quarkpp/auth.hpp) 提供独立于 CLI 的认证 API：`QrLoginClient::start()` 返回官方二维码 URL，`poll()` 返回登录状态，并在确认后返回会话 Cookie。调用方自行选择显示和保存方式。
 
 ```cpp
 #include <quarkpp/client.hpp>

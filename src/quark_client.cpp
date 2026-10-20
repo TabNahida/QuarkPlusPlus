@@ -963,7 +963,7 @@ UploadResult QuarkClient::upload_file(const std::filesystem::path &local_path, c
         throw QuarkException("Upload source is not a regular file");
     const auto file_name = new_name.value_or(path_to_utf8(local_path.filename()));
     validate_name(file_name);
-    const auto file_size = std::filesystem::file_size(local_path);
+    const std::uint64_t file_size = std::filesystem::file_size(local_path);
     const auto modified = std::filesystem::last_write_time(local_path);
     const auto unchanged = [&]
     {

@@ -317,8 +317,10 @@ struct QrLoginClient::Impl
         if (!exchanged)
         {
             const auto data = response_json(get(options.pan_base + "/account/info", {{"st", ticket}, {"lw", "scan"}}));
-            if ((data.contains("success") && data["success"] != true) ||
-                (data.contains("code") && status_code(data, "code") != 0))
+            const auto code = data.find("code");
+            const bool code_ok =
+                code == data.end() || (code->is_number_integer() && *code == 0) || (code->is_string() && *code == "OK");
+            if ((data.contains("success") && data["success"] != true) || !code_ok)
                 throw QuarkException("QR login ticket exchange was rejected");
             exchanged = true;
             ticket.clear();
