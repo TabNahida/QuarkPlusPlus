@@ -1,6 +1,7 @@
 #include "quarkpp/client.hpp"
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <httplib.h>
@@ -87,6 +88,25 @@ struct Server
     int port{};
     void start()
     {
+        http.set_exception_handler(
+            [](const httplib::Request &request, httplib::Response &response, std::exception_ptr exception)
+            {
+                try
+                {
+                    std::rethrow_exception(exception);
+                }
+                catch (const std::exception &error)
+                {
+                    std::cerr << "Test server handler failed (" << request.method << ' ' << request.path
+                              << "): " << error.what() << '\n';
+                }
+                catch (...)
+                {
+                    std::cerr << "Test server handler failed with an unknown exception\n";
+                }
+                response.status = 500;
+                response.set_content("Test server handler failed", "text/plain");
+            });
         port = http.bind_to_any_port("127.0.0.1");
         check(port > 0, "bind test server");
         thread = std::thread([this] { http.listen_after_bind(); });
@@ -131,7 +151,14 @@ int main()
         check(encrypt_wg("hello") == "NxTFGiL/qySwJSpexPNDuS1r", "known wg encryption vector");
         Server server;
         Temp temp;
-        std::atomic<int> list_calls{0}, puts{0}, finishes{0}, hash_calls{0}, download_calls{0};
+        std::atomic<int> list_calls{0}, puts{0}, finishes{0}, hash_calls{0}, download_calls{0}, byte_calls{0};
+        enum class DownloadScenario
+        {
+            unexpected,
+            resume,
+            full
+        };
+        std::atomic<DownloadScenario> download_scenario{DownloadScenario::unexpected};
         std::string mode = "listing";
         std::string uploaded;
         std::string issued_download_ua;
@@ -306,6 +333,7 @@ int main()
             "/bytes",
             [&](const httplib::Request &request, httplib::Response &response)
             {
+                ++byte_calls;
                 check(!issued_download_ua.empty() && request.get_header_value("User-Agent") == issued_download_ua,
                       "byte GET must use the same identity as URL issuance");
                 const auto cookie = request.get_header_value("Cookie");
@@ -314,7 +342,12 @@ int main()
                           cookie.find("other=preserved") != std::string::npos &&
                           cookie.find("unrelated=") == std::string::npos && cookie.find("stale") == std::string::npos,
                       "byte GET must use the refreshed cookie and preserve other credentials");
-                check(request.get_header_value("Range") == (mode == "retry-url" ? "" : "bytes=5-"), "resume offset");
+                const auto scenario = download_scenario.load();
+                check(scenario != DownloadScenario::unexpected, "unexpected byte download");
+                if (scenario == DownloadScenario::resume)
+                    check(request.get_header_value("Range") == "bytes=5-", "resume must start at byte 5");
+                else
+                    check(request.get_header_value("Range").empty(), "full download must not send a Range header");
                 // cpp-httplib's server applies the requested Range to the full body.
                 response.set_content("hello world", "application/octet-stream");
             });
@@ -455,6 +488,7 @@ int main()
             std::ofstream file(output, std::ios::binary);
             file << "hello";
         }
+        download_scenario = DownloadScenario::resume;
         client.download_to_file("file", output, true);
         std::string adapter_download_ua;
         for (const auto &[name, value] : client.download_headers())
@@ -472,6 +506,7 @@ int main()
         std::filesystem::create_directory_symlink(std::filesystem::canonical(temp.path), alias_root, symlink_error);
         if (!symlink_error)
         {
+            download_scenario = DownloadScenario::full;
             client.download_to_file("file", alias_root / "alias-exact.bin", false);
             check(std::filesystem::file_size(temp.path / "alias-exact.bin") == 11,
                   "caller-selected directory alias supports exact downloads");
@@ -481,9 +516,12 @@ int main()
             const auto guarded = temp.path / "guarded";
             std::filesystem::create_directory(guarded);
             std::filesystem::create_symlink(source, guarded / "data.bin");
+            download_scenario = DownloadScenario::unexpected;
+            const auto guarded_byte_calls = byte_calls.load();
             fails([&] { client.download("file", guarded, false); }, "remote-named file symlink must fail");
             fails([&] { client.download_to_file("file", guarded / "data.bin", false); },
                   "exact destination file symlink must fail");
+            check(byte_calls == guarded_byte_calls, "file symlinks must be rejected before requesting bytes");
             check(std::filesystem::file_size(source) == 11, "symlink target is unchanged");
             std::filesystem::remove(alias_root);
         }
@@ -492,6 +530,7 @@ int main()
             throw std::runtime_error("Unable to create directory symlink fixture");
 #endif
         mode = "retry-url";
+        download_scenario = DownloadScenario::full;
         {
             std::ofstream file(output, std::ios::binary);
             file << "OLD!";
