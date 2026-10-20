@@ -88,7 +88,10 @@ and [BoxPlayer](https://github.com/gaozhangmin/boxplayer/blob/5aa925cdddb18a97a1
   beginning; uploaded-part checkpoints are not persisted. In-process retries
   preserve successful parts.
 - Directory downloads preserve empty directories and validate remote names,
-  collisions and existing local symbolic links before writing files.
+  collisions and existing local symbolic links before writing files. The
+  caller's selected output directory is resolved first, allowing system aliases
+  such as macOS `/var`; remote-derived components and final file destinations
+  still cannot redirect writes through a symbolic link.
 
 The multipart and basic file-operation wire fields were cross-checked against
 [OpenList's Quark/UC implementation](https://github.com/OpenListTeam/OpenList/tree/main/drivers/quark_uc).

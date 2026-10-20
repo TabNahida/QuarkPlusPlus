@@ -2,6 +2,8 @@
 
 ## Verification record — 2026-10-20
 
+- Terminal QR login: the user scanned the locally generated QR code and confirmed in the Quark app. The CLI exchanged the ticket, obtained drive credentials, and saved a private local config. New CLI processes successfully queried the account and listed the root using only that saved QR session. No manually copied Cookie was used for this check. Regression tests cover the account endpoint's actual string `code:"OK"`, legacy numeric zero, and rejection of invalid status types. Sanitized evidence is retained locally in `build/live-verification/qr-login.json`.
+
 - Windows x64: xmake 3.1.1, MSVC C++20, cpp-httplib 0.34.0, OpenSSL 3.6.1. Release CLI/library build, all three test suites, CLI help/version, and staged installation passed.
 - Linux x64: Ubuntu 24.04 under WSL, GCC 13.3, OpenSSL 3.0.13, the same cpp-httplib header. Separate compiler/linker builds of CLI and all three test suites passed. This was a direct compiler check, not a Linux xmake package-resolution run.
 - After the live multipart fix and optional CLI progress output were added, Windows/xmake and Linux/GCC builds and all three offline suites passed again. The client regression now rejects an accidental parallel preflight declaration and verifies that a part-2 `NoHashContext` error includes useful context without sensitive OSS response fields.

@@ -467,6 +467,30 @@ int main()
         if (bytes != "hello world")
             throw std::runtime_error("resumed download bytes: " + bytes);
         input.close();
+        const auto alias_root = temp.path / "selected-alias";
+        std::error_code symlink_error;
+        std::filesystem::create_directory_symlink(std::filesystem::canonical(temp.path), alias_root, symlink_error);
+        if (!symlink_error)
+        {
+            client.download_to_file("file", alias_root / "alias-exact.bin", false);
+            check(std::filesystem::file_size(temp.path / "alias-exact.bin") == 11,
+                  "caller-selected directory alias supports exact downloads");
+            client.download("file", alias_root / "named", false);
+            check(std::filesystem::file_size(temp.path / "named" / "data.bin") == 11,
+                  "caller-selected directory alias supports remote-named downloads");
+            const auto guarded = temp.path / "guarded";
+            std::filesystem::create_directory(guarded);
+            std::filesystem::create_symlink(source, guarded / "data.bin");
+            fails([&] { client.download("file", guarded, false); }, "remote-named file symlink must fail");
+            fails([&] { client.download_to_file("file", guarded / "data.bin", false); },
+                  "exact destination file symlink must fail");
+            check(std::filesystem::file_size(source) == 11, "symlink target is unchanged");
+            std::filesystem::remove(alias_root);
+        }
+#ifndef _WIN32
+        else
+            throw std::runtime_error("Unable to create directory symlink fixture");
+#endif
         mode = "retry-url";
         {
             std::ofstream file(output, std::ios::binary);

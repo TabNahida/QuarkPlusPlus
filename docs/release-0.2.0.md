@@ -24,9 +24,11 @@ The GitHub Actions matrix builds, runs offline integration tests, checks the ins
 
 ## Verified behavior and limits
 
+Terminal QR login was verified with a real account, including automatic private session storage and successful account/list queries from new CLI processes.
+
 Real-account tests verified a 250,000,000-byte upload/download with an interrupted transfer, resumed download, and matching SHA-256. A separate 4,311,744,513-byte upload and a WebDAV read beyond the 4 GiB boundary passed. The entire 4 GiB file was not downloaded for a full hash comparison. Cloud BT selected-file download and WebDAV operations through rclone were also verified.
 
-Native filesystem mounting depends on rclone and its platform filesystem driver; native mounts were not exercised on every platform. Uploads stream with bounded memory, but restarting the client starts a new upload rather than resuming an upload checkpoint. Quark's unofficial web protocol can change independently of this release.
+Native filesystem mounting depends on rclone and its platform filesystem driver; native mounts have not been exercised. Uploads stream with bounded memory, but restarting the client starts a new upload rather than resuming an upload checkpoint. Quark's unofficial web protocol can change independently of this release.
 
 ## Upgrading
 

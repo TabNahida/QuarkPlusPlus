@@ -1141,12 +1141,19 @@ void QuarkClient::download_entry(const RemoteEntry &entry, const std::filesystem
 void QuarkClient::download_to_file(const std::string &fid, const std::filesystem::path &destination, bool resume,
                                    const ProgressCallback &progress) const
 {
-    download_entry(file_info(fid), destination, resume, progress);
+    // Resolve the caller's directory choice, including macOS /var -> /private/var.
+    // Preserve the final component so an existing destination symlink is rejected.
+    const auto absolute = std::filesystem::absolute(destination);
+    const auto resolved = std::filesystem::weakly_canonical(absolute.parent_path()) / absolute.filename();
+    download_entry(file_info(fid), resolved, resume, progress);
 }
 
 void QuarkClient::download(const std::string &fid, const std::filesystem::path &output_root, bool resume,
                            const ProgressCallback &progress) const
 {
+    // The caller may deliberately select a directory alias. Only this trusted
+    // root is resolved; every remote-derived component below it is checked.
+    const auto root = std::filesystem::weakly_canonical(std::filesystem::absolute(output_root));
     const auto targets = collect_download_targets(fid);
     // Validate all materialized paths before writing any file.
     std::unordered_set<std::string> names;
@@ -1158,11 +1165,11 @@ void QuarkClient::download(const std::string &fid, const std::filesystem::path &
 #endif
         if (!names.insert(name).second)
             throw QuarkException("Remote names collide on the local filesystem");
-        reject_symlink_path(output_root / target.relative_path);
+        reject_symlink_path(root / target.relative_path);
     }
     for (const auto &target : targets)
     {
-        const auto destination = output_root / target.relative_path;
+        const auto destination = root / target.relative_path;
         if (target.dir)
             std::filesystem::create_directories(destination);
         else
