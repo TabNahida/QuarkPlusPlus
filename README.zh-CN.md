@@ -32,7 +32,7 @@
 | 跨平台挂载 | 带认证的本地 WebDAV，配合 rclone mount 挂载到三大桌面平台 |
 | 二次开发 | 独立的 `quarkpp_core` 静态库、公开头文件与进度回调 |
 
-本项目是使用夸克私有网页接口的**非官方客户端**。账号权限、配额、速度限制、资源可用性及上游协议变更仍然生效，详见[协议说明](docs/protocol.md)。已验证 Windows/xmake、Linux/GCC 编译、本地集成测试、真实账号的 4.02 GiB 上传、通过 SHA-256 校验的 250 MB 上传下载与实际中断续传，以及已完成的 BT 云下载。具体大小与边界见[验证记录](docs/testing.md)。macOS 编译与各系统实际挂载尚未完成验证，仓库提供三平台 CI 工作流。
+本项目是使用夸克私有网页接口的**非官方客户端**。账号权限、配额、速度限制、资源可用性及上游协议变更仍然生效，详见[协议说明](docs/protocol.md)。已验证 Windows/xmake、Linux/GCC 编译、本地集成测试、真实账号的 4.02 GiB 上传、通过 SHA-256 校验的 250 MB 上传下载与实际中断续传，以及已完成的 BT 云下载。具体大小与边界见[验证记录](docs/testing.md)。GitHub Actions 会构建并测试 Windows x64、Linux x64、macOS Intel 和 Apple Silicon，四项全部成功后才会发布版本。各系统实际挂载尚未验证。
 
 ## 快速开始
 

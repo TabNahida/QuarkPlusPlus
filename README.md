@@ -32,7 +32,7 @@ English · [简体中文](README.zh-CN.md)
 | Mount your drive | Authenticated local WebDAV for rclone mount on Windows, Linux, and macOS |
 | Build on the API | Installable `quarkpp_core` static library with public headers and progress callbacks |
 
-This is an **unofficial client** using Quark's private web APIs. Account privileges, quotas, speed limits, resource availability, and protocol changes still apply. See [protocol notes](docs/protocol.md). Windows/xmake and Linux/GCC builds and local integration tests are verified, along with a real 4.02 GiB upload, a SHA-256-checked 250 MB upload/download with interrupted-download resume, and a completed cloud BT download. See the [verification record](docs/testing.md) for exact sizes and limits. macOS builds and native OS mounts remain unverified; CI is provided for all three platforms.
+This is an **unofficial client** using Quark's private web APIs. Account privileges, quotas, speed limits, resource availability, and protocol changes still apply. See [protocol notes](docs/protocol.md). Windows/xmake and Linux/GCC builds and local integration tests are verified, along with a real 4.02 GiB upload, a SHA-256-checked 250 MB upload/download with interrupted-download resume, and a completed cloud BT download. See the [verification record](docs/testing.md) for exact sizes and limits. The GitHub Actions matrix builds and tests Windows x64, Linux x64, macOS Intel, and macOS Apple Silicon; release publication requires all four jobs to succeed. Native OS mounts remain unverified.
 
 ## Quick start
 

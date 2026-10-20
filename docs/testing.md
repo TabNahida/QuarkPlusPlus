@@ -17,7 +17,7 @@
 - The opt-in `scripts/live-smoke.ps1` runner passed a real-account run with an empty file and `small-测试.bin` (1,048,609 bytes), including metadata validation, full-download hashes and resume from a known half-file prefix. Its dedicated nested directory was recycled and confirmed absent from its parent afterward.
 - Real large upload: a generated 4,311,744,513-byte file (4 GiB + 16 MiB + 1) completed normal multipart upload (`fast_upload:false`) in 1,523.82 seconds. The sampled peak process working set was 18,440,192 bytes (17.6 MiB). A separate real WebDAV read returned 256 matching bytes at offset 4,294,968,320, beyond 4 GiB.
 - The 4.02 GiB whole-file download was stopped at the user's request after changing the round-trip fixture to 250 MB. It actually resumed from 90,271,744 bytes and reached 129,146,880 bytes, but did not complete full-file hashing. The large upload and high-offset WebDAV results above remain verified; a full 4.02 GiB download is not claimed.
-- macOS compilation and native OS mounts remain unverified. See the live acceptance procedure below.
+- GitHub Actions builds and runs all five suites on Windows x64, Ubuntu 24.04 x64, macOS Intel and macOS Apple Silicon. Release publication requires all four builds, installed-CLI checks, and packaging jobs to succeed. See the [remote build history](https://github.com/TabNahida/QuarkPlusPlus/actions/workflows/build.yml). Native OS mounts remain unverified.
 
 ## Offline regression suite
 
