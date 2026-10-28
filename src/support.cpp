@@ -1,3 +1,4 @@
+#include "thread_group.hpp"
 #include "tls_trust.hpp"
 #include <httplib.h>
 #include <openssl/evp.h>
@@ -242,7 +243,7 @@ std::optional<HttpResponse> download_parallel(const HttpClient &client, const st
             static_cast<unsigned>(std::min<std::uint64_t>(threads, (total - committed - 1) / chunk_size + 1));
         std::vector<Segment> segments(count);
         {
-            std::vector<std::jthread> workers;
+            detail::ThreadGroup workers(count);
             for (unsigned i = 0; i < count; ++i)
             {
                 auto &segment = segments[i];

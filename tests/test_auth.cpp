@@ -3,6 +3,7 @@
 #include <atomic>
 #include <httplib.h>
 #include <iostream>
+#include <map>
 #include <thread>
 
 namespace
@@ -28,6 +29,23 @@ template <class F> std::string fails(F operation, const char *message)
 void reply(httplib::Response &response, const json &value)
 {
     response.set_content(value.dump(), "application/json");
+}
+std::map<std::string, std::string> cookie_fields(std::string_view header)
+{
+    std::map<std::string, std::string> fields;
+    while (!header.empty())
+    {
+        const auto end = header.find(';');
+        const auto field = trim(header.substr(0, end));
+        const auto equal = field.find('=');
+        check(equal != std::string::npos && equal > 0, "valid cookie field");
+        check(fields.emplace(field.substr(0, equal), field.substr(equal + 1)).second,
+              "duplicate credential cookies must not survive refresh");
+        if (end == std::string_view::npos)
+            break;
+        header.remove_prefix(end + 1);
+    }
+    return fields;
 }
 struct Server
 {
@@ -191,7 +209,12 @@ int main()
         auto result = login.poll();
         check(result.status == QrLoginStatus::authenticated && exchange_parameters && redirect_cookie && config_cookie,
               "ticket exchange and cookie propagation");
-        check(result.cookie == "__pus=pus-secret; __uid=uid-secret; __kps=kps-secret; __puus=new-secret",
+        // Distinct cookie names have no header ordering requirement. httplib's
+        // response container may emit its Set-Cookie fields in a different order
+        // on each standard library; PACE preserves their actual wire order.
+        const std::map<std::string, std::string> expected_cookies{
+            {"__pus", "pus-secret"}, {"__uid", "uid-secret"}, {"__kps", "kps-secret"}, {"__puus", "new-secret"}};
+        check(cookie_fields(result.cookie) == expected_cookies,
               "all response cookies merged and refreshed");
         check(login.poll().cookie == result.cookie && exchanges == 1, "completed session avoids ticket replay");
         login.cancel();

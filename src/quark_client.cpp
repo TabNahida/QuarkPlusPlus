@@ -1,4 +1,5 @@
 #include "quarkpp/client.hpp"
+#include "thread_group.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1340,8 +1341,7 @@ void QuarkClient::download_batch(const std::vector<std::string> &fids, const std
                 }
             };
             {
-                std::vector<std::jthread> workers;
-                workers.reserve(std::min<std::size_t>(jobs, count));
+                detail::ThreadGroup workers(std::min<std::size_t>(jobs, count));
                 for (std::size_t n = 0; n < std::min<std::size_t>(jobs, count); ++n)
                     workers.emplace_back(worker);
             }
