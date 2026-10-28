@@ -1,5 +1,5 @@
 set_project("QuarkPlusPlus")
-set_version("0.2.0")
+set_version("0.3.0")
 set_xmakever("2.9.8")
 
 set_languages("c++20")
@@ -10,10 +10,15 @@ if is_plat("windows") then
 end
 
 add_rules("mode.debug", "mode.release")
+add_repositories("quarkpp-packages .")
+add_requires("pace 0.4.0", {system = false})
 add_requires("nlohmann_json 3.12.0")
 add_requires("openssl3 3.6.1", {configs = {shared = false}})
 add_requires("cpp-httplib 0.34.0", {configs = {ssl = true}})
 add_requireconfs("cpp-httplib.openssl3", {version = "3.6.1", override = true})
+add_requireconfs("pace.openssl3", {version = "3.6.1", override = true,
+    system = false, configs = {shared = false}})
+add_requireconfs("pace.c-ares", {system = false, configs = {shared = false}})
 
 option("tests")
     set_default(false)
@@ -39,16 +44,20 @@ target("quarkpp_core")
     add_rules("quarkpp.webdav_methods")
     set_kind("static")
     set_basename("quarkpp")
-    add_files("src/quark_client.cpp", "src/support.cpp", "src/auth.cpp")
+    add_files("src/quark_client.cpp", "src/support.cpp", "src/auth.cpp", "src/tls_trust.cpp")
     add_headerfiles("include/(quarkpp/*.hpp)")
     add_includedirs("include", {public = true})
-    add_packages("nlohmann_json", "openssl3", "cpp-httplib", {public = true})
+    add_packages("pace", "nlohmann_json", "openssl3", "cpp-httplib", {public = true})
     add_defines("CPPHTTPLIB_OPENSSL_SUPPORT", {public = true})
     if is_plat("windows") then
         add_defines("NOMINMAX", "WIN32_LEAN_AND_MEAN", {public = true})
         add_syslinks("ws2_32", "crypt32", {public = true})
     else
         add_syslinks("pthread", {public = true})
+        if is_plat("macosx") then
+            add_defines("CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN", {public = true})
+            add_frameworks("Security", "CoreFoundation", {public = true})
+        end
     end
 
 target("quarkpp")

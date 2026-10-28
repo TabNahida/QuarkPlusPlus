@@ -9,7 +9,7 @@ A reusable C++20 library, a focused command-line client, and a local WebDAV brid
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
 ![Build](https://img.shields.io/badge/build-xmake-22A079)
 [![CI](https://github.com/TabNahida/QuarkPlusPlus/actions/workflows/build.yml/badge.svg)](https://github.com/TabNahida/QuarkPlusPlus/actions/workflows/build.yml)
-![HTTP](https://img.shields.io/badge/HTTP-cpp--httplib-455A64)
+![HTTP](https://img.shields.io/badge/HTTP-PACE_0.4.0-455A64)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 English · [简体中文](README.zh-CN.md)
@@ -27,12 +27,13 @@ English · [简体中文](README.zh-CN.md)
 | Sign in by QR code | Scan in the Quark mobile app; the CLI saves your session locally |
 | Browse and manage | Paginated listing, search, file information, folders, rename, recycle-bin deletion |
 | Upload large files | Streaming MD5/SHA1, fast-upload check, OSS multipart upload, bounded memory, part retries |
-| Download large files | Streaming to disk, 64-bit offsets, validated HTTP Range resume, refreshed links on retry |
+| Download large files | Parallel byte ranges, streaming to disk, 64-bit offsets, validated resume, refreshed links on retry |
+| Batch small files | Concurrent downloads, batched link requests, recursive folders, aggregate progress |
 | Cloud BT downloads | Parse magnet/HTTP(S) sources, select files, submit to Quark, inspect and wait for tasks |
 | Mount your drive | Authenticated local WebDAV for rclone mount on Windows, Linux, and macOS |
 | Build on the API | Installable `quarkpp_core` static library with public headers and progress callbacks |
 
-This is an **unofficial client** using Quark's private web APIs. Account privileges, quotas, speed limits, resource availability, and protocol changes still apply. See [protocol notes](docs/protocol.md). Windows/xmake and Linux/GCC builds and local integration tests are verified, along with a real 4.02 GiB upload, a SHA-256-checked 250 MB upload/download with interrupted-download resume, and a completed cloud BT download. See the [verification record](docs/testing.md) for exact sizes and limits. The GitHub Actions matrix builds and tests Windows x64, Linux x64, macOS Intel, and macOS Apple Silicon; release publication requires all four jobs to succeed. Native OS mounts remain unverified.
+This is an **unofficial client** using Quark's private web APIs. Account privileges, quotas, speed limits, resource availability, and protocol changes still apply. See [protocol notes](docs/protocol.md). Earlier verification covered Windows/xmake and Linux/GCC builds and local integration tests, a real 4.02 GiB upload, a SHA-256-checked 250 MB upload/download with interrupted-download resume, and a completed cloud BT download. See the dated [verification record](docs/testing.md) for exact sizes and limits. The GitHub Actions matrix builds and tests Windows x64, Linux x64, macOS Intel, and macOS Apple Silicon; release publication requires all four jobs to succeed. Native OS mounts remain unverified.
 
 ## Quick start
 
@@ -46,7 +47,7 @@ xmake
 xmake run quarkpp --help
 ```
 
-xmake resolves pinned cpp-httplib, OpenSSL 3, and nlohmann/json packages. The build generates a local cpp-httplib header with three additional WebDAV method names; it does not modify your global package cache. See [architecture](docs/architecture.md).
+xmake resolves pinned PACE 0.4.0, cpp-httplib, OpenSSL 3, c-ares, and nlohmann/json packages. PACE's direct HTTP client handles buffered API requests; cpp-httplib handles streaming transfers and the WebDAV server. The build generates a local cpp-httplib header with three additional WebDAV method names; it does not modify your global package cache. See [architecture](docs/architecture.md).
 
 Sign in from your terminal:
 
@@ -65,6 +66,10 @@ If your terminal cannot render the code clearly, add `--qr-svg login.svg` and op
   "request_timeout_ms": 120000,
   "upload_retry_count": 3,
   "download_retry_count": 3,
+  "download_threads": 4,
+  "download_jobs": 4,
+  "download_batch_size": 20,
+  "small_file_threshold": 8388608,
   "task_poll_limit": 30
 }
 ```
@@ -96,11 +101,24 @@ quarkpp upload ./movie.mkv --to-path /Videos --progress
 quarkpp upload ./notes.txt --to-fid 0 --name notes-backup.txt
 quarkpp download --path /Videos/movie.mkv --out ./downloads --progress
 quarkpp download --path /Documents --out ./backup
+quarkpp download --path /Documents/a.txt --path /Documents/b.txt --out ./backup --jobs 4
+quarkpp download --fid FILE_ID --out ./downloads --threads 8 --progress
 ```
 
 Paths and IDs are interchangeable via `--path` / `--fid`, or `--to-path` / `--to-fid` for upload destinations. Downloading a folder preserves its name, contents, and empty subfolders beneath `--out`. `--json` produces machine-readable listings; other command results already use JSON. Errors go to stderr and return a nonzero exit code.
 
-Add `--progress` to upload or download commands for current-file byte counts on stderr, at most once per second, and a final completion line. JSON results remain on stdout.
+Repeat `--fid` or `--path` to download several selections in one batch. The library exposes the same operation as `download_batch(fids, output_root)`. Downloads validate all selected local paths before starting file transfers; conflicting names are rejected.
+
+Add `--progress` to upload or download commands for byte counts on stderr, at most once per second, and a final completion line. Download progress covers the whole selected batch. JSON results remain on stdout.
+
+| Download option | Config key | Default | Meaning |
+| --- | --- | ---: | --- |
+| `--threads N` | `download_threads` | 4 | Range workers per large file; 1 uses a single stream |
+| `--jobs N` | `download_jobs` | 4 | Concurrent small-file downloads |
+| `--batch-size N` | `download_batch_size` | 20 | Maximum files per download-link request |
+| `--small-file-threshold BYTES` | `small_file_threshold` | 8388608 | Small-file size limit (8 MiB) |
+
+Thread and job counts accept 1–32; batch size accepts 1–100. Command-line options override configuration for that download.
 
 ### Large transfers
 
@@ -193,7 +211,7 @@ int main() {
 }
 ```
 
-Inside this xmake project, use `add_deps("quarkpp_core")`. Installed consumers link `quarkpp` plus OpenSSL and platform socket/thread libraries, and include nlohmann/json. Methods are synchronous, report progress through callbacks, and do not print. Provider and transport failures throw `quarkpp::QuarkException`; filesystem and JSON exceptions may also propagate. Public types and methods are in [client.hpp](include/quarkpp/client.hpp) and [support.hpp](include/quarkpp/support.hpp).
+Inside this xmake project, use `add_deps("quarkpp_core")`. Installed consumers link `quarkpp`, PACE 0.4.0 with HTTP/1, TLS and DNS enabled, OpenSSL, c-ares, and platform socket/thread libraries, and include nlohmann/json. Third-party SDK dependencies are resolved separately; the archive contains the QuarkPlusPlus static library. Match the compiler ABI and runtime (MSVC `/MT` on Windows). Methods are synchronous, report progress through callbacks, and do not print. Provider and transport failures throw `quarkpp::QuarkException`; filesystem and JSON exceptions may also propagate. Public types and methods are in [client.hpp](include/quarkpp/client.hpp) and [support.hpp](include/quarkpp/support.hpp).
 
 ## Development
 

@@ -1,12 +1,14 @@
 #include "quarkpp/client.hpp"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <httplib.h>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <openssl/evp.h>
 #include <thread>
 
@@ -140,6 +142,174 @@ struct Temp
         std::filesystem::remove_all(path, ec);
     }
 };
+
+void test_batch_downloads()
+{
+    Server server;
+    Temp temp;
+    std::atomic<int> links{0}, bytes{0}, active{0}, peak{0}, resumed{0};
+    std::atomic<bool> barrier{true}, missing_link{false}, retry_one{false};
+    std::mutex barrier_mutex;
+    std::condition_variable started;
+    server.http.Get("/api/file/info",
+                    [&](const httplib::Request &request, httplib::Response &response)
+                    {
+                        const auto id = request.get_param_value("fid");
+                        if (id == "B0")
+                        {
+                            reply(response, entry(id, "B0.BIN", 1024));
+                            return;
+                        }
+                        reply(response, entry(id, id == "dir" || id == "collision" ? "bundle" : id + ".bin",
+                                              id == "dir" ? 0 : 1024, id == "dir"));
+                    });
+    server.http.Get("/api/file/sort",
+                    [&](const httplib::Request &request, httplib::Response &response)
+                    {
+                        json files = json::array();
+                        if (request.get_param_value("pdir_fid") == "dir")
+                        {
+                            for (unsigned i = 0; i < 5; ++i)
+                                files.push_back(entry("b" + std::to_string(i), "b" + std::to_string(i) + ".bin", 1024));
+                            files.push_back(entry("nested", "nested", 0, true));
+                        }
+                        reply(response, {{"list", files}});
+                    });
+    server.http.Post("/api/file/download",
+                     [&](const httplib::Request &request, httplib::Response &response)
+                     {
+                         ++links;
+                         const auto ids = json::parse(request.body).at("fids").get<std::vector<std::string>>();
+                         check(!ids.empty() && ids.size() <= 3, "provider link batches must respect configured size");
+                         json urls = json::array();
+                         for (const auto &id : ids)
+                             if (!missing_link || id != ids.back())
+                                 urls.push_back({{"fid", id}, {"download_url", server.base() + "/small/" + id}});
+                         response.set_header("Set-Cookie", "__puus=batch-refresh; Path=/");
+                         reply(response, urls);
+                     });
+    server.http.Get(R"(/small/(b[0-4]))",
+                    [&](const httplib::Request &request, httplib::Response &response)
+                    {
+                        ++bytes;
+                        check(request.get_header_value("Cookie").find("__puus=batch-refresh") != std::string::npos,
+                              "batch byte requests must use refreshed credentials");
+                        const auto id = request.matches[1].str();
+                        if (retry_one && id == "b1")
+                        {
+                            retry_one = false;
+                            response.status = 403;
+                            return;
+                        }
+                        if (!request.get_header_value("Range").empty())
+                        {
+                            check(request.get_header_value("Range") == "bytes=17-", "batch prefix resume offset");
+                            ++resumed;
+                        }
+                        const auto inflight = ++active;
+                        auto maximum = peak.load();
+                        while (maximum < inflight && !peak.compare_exchange_weak(maximum, inflight))
+                        {
+                        }
+                        started.notify_all();
+                        if (barrier && id <= "b2")
+                        {
+                            std::unique_lock lock(barrier_mutex);
+                            const bool overlap =
+                                started.wait_for(lock, std::chrono::seconds(2), [&] { return peak >= 3; });
+                            --active;
+                            check(overlap, "small-file downloads must actually overlap");
+                        }
+                        else
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                            --active;
+                        }
+                        response.set_content(std::string(1024, id.back()), "application/octet-stream");
+                    });
+    server.start();
+    AppConfig config;
+    config.cookie = "test=value; __puus=stale";
+    config.api_base = config.offline_api_base = server.base() + "/api";
+    config.download_jobs = config.download_batch_size = 3;
+    config.download_retry_count = 2;
+    QuarkClient client(config);
+    const auto output = temp.path / "selected";
+    std::uint64_t last = 0;
+    std::atomic<int> callbacks{0};
+    client.download("dir", output, true,
+                    [&](std::uint64_t current, std::uint64_t total)
+                    {
+                        check(callbacks.fetch_add(1) == 0, "aggregate progress callbacks must be serialized");
+                        check(current >= last && total == 5 * 1024, "monotonic progress must cover the entire batch");
+                        last = current;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        --callbacks;
+                    });
+    check(links == 2 && bytes == 5 && peak == 3 && last == 5 * 1024,
+          "directory download must batch links, bound workers, and report complete aggregate progress");
+    check(std::filesystem::is_directory(output / "bundle/nested"), "batch download must preserve empty directories");
+    for (unsigned i = 0; i < 5; ++i)
+    {
+        std::ifstream file(output / "bundle" / ("b" + std::to_string(i) + ".bin"), std::ios::binary);
+        const std::string content{std::istreambuf_iterator<char>(file), {}};
+        check(content == std::string(1024, static_cast<char>('0' + i)), "concurrent batch file bytes");
+    }
+    barrier = false;
+    std::filesystem::remove(output / "bundle/b2.bin");
+    {
+        std::ofstream prefix(output / "bundle/b3.bin", std::ios::binary | std::ios::trunc);
+        prefix << std::string(17, '3');
+    }
+    client.download("dir", output);
+    check(links == 3 && bytes == 7 && resumed == 1, "batch resume must skip complete files and resume partial files");
+    client.download("dir", output);
+    check(links == 3 && bytes == 7, "completed batch must not request links or bytes again");
+
+    const auto explicit_output = temp.path / "explicit";
+    retry_one = true;
+    client.download_batch({"b0", "b1", "b1"}, explicit_output, false);
+    check(links == 5 && bytes == 10 && !retry_one,
+          "explicit batch must deduplicate IDs and refresh a failed file link independently");
+    const auto prior_links = links.load();
+    fails([&] { client.download_batch({"collision", "dir"}, temp.path / "collision"); },
+          "overlapping selected paths must fail");
+    check(links == prior_links && !std::filesystem::exists(temp.path / "collision"),
+          "batch path collisions must fail before local writes or link requests");
+#if defined(_WIN32) || defined(__APPLE__)
+    fails([&] { client.download_batch({"b0", "B0"}, temp.path / "case-collision"); },
+          "case-insensitive selected path collisions must fail");
+    check(links == prior_links && !std::filesystem::exists(temp.path / "case-collision"),
+          "case-insensitive collisions must fail before local writes or link requests");
+#endif
+    missing_link = true;
+    const auto prior_bytes = bytes.load();
+    fails([&] { client.download_batch({"b0", "b1"}, temp.path / "missing"); }, "missing selected link must fail");
+    check(bytes == prior_bytes, "missing batch links must be rejected before starting that batch");
+    missing_link = false;
+    const auto message = fails(
+        [&]
+        {
+            client.download_batch({"b0", "b1", "b2"}, temp.path / "callback", true,
+                                  [](std::uint64_t current, std::uint64_t)
+                                  {
+                                      if (current > 0)
+                                          throw std::runtime_error("batch-callback-aborted");
+                                  });
+        },
+        "batch progress exception must propagate");
+    check(message == "batch-callback-aborted" && active == 0,
+          "batch callback errors must propagate after worker cleanup");
+    for (const auto invalid : {0U, 33U})
+    {
+        auto bad = config;
+        bad.download_jobs = invalid;
+        fails([&] { QuarkClient rejected(bad); }, "invalid download jobs must fail");
+    }
+    auto bad = config;
+    bad.download_batch_size = 101;
+    fails([&] { QuarkClient rejected(bad); }, "invalid download batch size must fail");
+}
 } // namespace
 
 int main()
@@ -147,6 +317,7 @@ int main()
     try
     {
         using namespace quarkpp;
+        test_batch_downloads();
         check(decrypt_wg("NxTFGiL/qySwJSpexPNDuS1r") == "hello", "known wg protocol vector");
         check(encrypt_wg("hello") == "NxTFGiL/qySwJSpexPNDuS1r", "known wg encryption vector");
         Server server;

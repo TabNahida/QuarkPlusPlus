@@ -9,7 +9,7 @@
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
 ![Build](https://img.shields.io/badge/build-xmake-22A079)
 [![CI](https://github.com/TabNahida/QuarkPlusPlus/actions/workflows/build.yml/badge.svg)](https://github.com/TabNahida/QuarkPlusPlus/actions/workflows/build.yml)
-![HTTP](https://img.shields.io/badge/HTTP-cpp--httplib-455A64)
+![HTTP](https://img.shields.io/badge/HTTP-PACE_0.4.0-455A64)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 [English](README.md) · 简体中文
@@ -27,12 +27,13 @@
 | 扫码登录 | 终端显示二维码，夸克手机 App 扫码确认后自动保存会话 |
 | 浏览与管理 | 自动分页、搜索、文件信息、新建目录、重命名、移入回收站 |
 | 大文件上传 | 流式 MD5/SHA1、秒传检查、OSS 分片上传、固定缓冲区、分片重试 |
-| 大文件下载 | 流式写盘、64 位偏移、校验 Range 的断点续传、重试时刷新下载链接 |
+| 大文件下载 | 多线程分段、流式写盘、64 位偏移、校验 Range 的断点续传、重试时刷新下载链接 |
+| 小文件批量下载 | 并发下载、批量获取链接、递归目录、汇总进度 |
 | BT 离线下载 | 解析磁力/HTTP(S) 链接、选择文件、提交夸克云端任务、查询和等待结果 |
 | 跨平台挂载 | 带认证的本地 WebDAV，配合 rclone mount 挂载到三大桌面平台 |
 | 二次开发 | 独立的 `quarkpp_core` 静态库、公开头文件与进度回调 |
 
-本项目是使用夸克私有网页接口的**非官方客户端**。账号权限、配额、速度限制、资源可用性及上游协议变更仍然生效，详见[协议说明](docs/protocol.md)。已验证 Windows/xmake、Linux/GCC 编译、本地集成测试、真实账号的 4.02 GiB 上传、通过 SHA-256 校验的 250 MB 上传下载与实际中断续传，以及已完成的 BT 云下载。具体大小与边界见[验证记录](docs/testing.md)。GitHub Actions 会构建并测试 Windows x64、Linux x64、macOS Intel 和 Apple Silicon，四项全部成功后才会发布版本。各系统实际挂载尚未验证。
+本项目是使用夸克私有网页接口的**非官方客户端**。账号权限、配额、速度限制、资源可用性及上游协议变更仍然生效，详见[协议说明](docs/protocol.md)。此前版本已验证 Windows/xmake、Linux/GCC 编译、本地集成测试、真实账号的 4.02 GiB 上传、通过 SHA-256 校验的 250 MB 上传下载与实际中断续传，以及已完成的 BT 云下载。具体日期、大小与边界见[验证记录](docs/testing.md)。GitHub Actions 会构建并测试 Windows x64、Linux x64、macOS Intel 和 Apple Silicon，四项全部成功后才会发布版本。各系统实际挂载尚未验证。
 
 ## 快速开始
 
@@ -46,7 +47,7 @@ xmake
 xmake run quarkpp --help
 ```
 
-xmake 管理固定版本的 cpp-httplib、OpenSSL 3 和 nlohmann/json。构建会在本项目的生成目录中扩展 cpp-httplib 的 WebDAV 方法列表，不修改全局依赖缓存。
+xmake 管理固定版本的 PACE 0.4.0、cpp-httplib、OpenSSL 3、c-ares 和 nlohmann/json。普通 API 请求使用 PACE 的直接 HTTP 接口，流式文件传输和 WebDAV 服务使用 cpp-httplib。构建会在本项目的生成目录中扩展 cpp-httplib 的 WebDAV 方法列表，不修改全局依赖缓存。
 
 直接在终端登录：
 
@@ -65,6 +66,10 @@ xmake run quarkpp login
   "request_timeout_ms": 120000,
   "upload_retry_count": 3,
   "download_retry_count": 3,
+  "download_threads": 4,
+  "download_jobs": 4,
+  "download_batch_size": 20,
+  "small_file_threshold": 8388608,
   "task_poll_limit": 30
 }
 ```
@@ -95,11 +100,24 @@ quarkpp upload ./movie.mkv --to-path /Videos --progress
 quarkpp upload ./notes.txt --to-fid 0 --name notes-backup.txt
 quarkpp download --path /Videos/movie.mkv --out ./downloads --progress
 quarkpp download --path /Documents --out ./backup
+quarkpp download --path /Documents/a.txt --path /Documents/b.txt --out ./backup --jobs 4
+quarkpp download --fid FILE_ID --out ./downloads --threads 8 --progress
 ```
 
 `--fid`/`--path` 指定文件或目录，`--to-fid`/`--to-path` 指定上传位置。下载目录时，会在 `--out` 下保留目录名称、内容和空子目录。`--json` 将列表转换成便于脚本解析的 JSON，其他命令的结果默认使用 JSON。错误写入 stderr，并返回非零退出码。
 
-上传、下载命令加 `--progress` 后，会向 stderr 最多每秒输出一次当前文件的传输字节数，并在成功后输出完成行；stdout 仍保留 JSON 结果。
+重复传入 `--fid` 或 `--path` 可一次下载多个选择项，接口库也提供 `download_batch(fids, output_root)`。开始文件传输前会校验所有目标路径，重名冲突会明确报错。
+
+上传、下载命令加 `--progress` 后，会向 stderr 最多每秒输出一次传输字节数，并在成功后输出完成行；下载进度汇总本次选择的全部文件，stdout 仍保留 JSON 结果。
+
+| 下载选项 | 配置项 | 默认值 | 含义 |
+| --- | --- | ---: | --- |
+| `--threads N` | `download_threads` | 4 | 单个大文件的分段线程数，1 表示单流下载 |
+| `--jobs N` | `download_jobs` | 4 | 小文件并发下载数 |
+| `--batch-size N` | `download_batch_size` | 20 | 单次获取下载链接的文件数上限 |
+| `--small-file-threshold BYTES` | `small_file_threshold` | 8388608 | 小文件大小上限（8 MiB） |
+
+线程数和并发数范围为 1–32，批次大小范围为 1–100。命令行选项覆盖本次下载的配置值。
 
 ### 大文件传输
 
@@ -189,7 +207,7 @@ int main() {
 }
 ```
 
-项目内的 xmake target 使用 `add_deps("quarkpp_core")`。独立使用已安装的库时，需要链接 `quarkpp`、OpenSSL、平台 socket/thread 库，并提供 nlohmann/json 头文件。接口同步执行，通过回调报告进度，不向终端打印。服务端和传输错误使用 `quarkpp::QuarkException`，文件系统和 JSON 异常也可能向调用方传播。公开接口见 [client.hpp](include/quarkpp/client.hpp) 和 [support.hpp](include/quarkpp/support.hpp)。
+项目内的 xmake target 使用 `add_deps("quarkpp_core")`。独立使用已安装的库时，需要链接 `quarkpp`、启用 HTTP/1、TLS 和 DNS 的 PACE 0.4.0、OpenSSL、c-ares、平台 socket/thread 库，并提供 nlohmann/json 头文件。发布包包含 QuarkPlusPlus 静态库，第三方 SDK 依赖需单独准备；编译器 ABI 和运行时需要匹配，Windows 使用 MSVC `/MT`。接口同步执行，通过回调报告进度，不向终端打印。服务端和传输错误使用 `quarkpp::QuarkException`，文件系统和 JSON 异常也可能向调用方传播。公开接口见 [client.hpp](include/quarkpp/client.hpp) 和 [support.hpp](include/quarkpp/support.hpp)。
 
 ## 开发与测试
 

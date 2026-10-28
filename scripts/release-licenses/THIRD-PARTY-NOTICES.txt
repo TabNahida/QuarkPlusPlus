@@ -1,9 +1,20 @@
 QuarkPlusPlus binary distributions include the following components:
 
+PACE 0.4.0
+https://github.com/TabNahida/PACE/tree/v0.4.0
+Copyright (c) 2026 Tab Nahida; MIT License (PACE.txt).
+
+c-ares 1.34.8
+https://github.com/c-ares/c-ares/tree/v1.34.8
+Copyright (c) 1998 Massachusetts Institute of Technology;
+Copyright (c) 2007 - 2023 Daniel Stenberg with many contributors.
+MIT License (c-ares.txt).
+
 cpp-httplib 0.34.0
 https://github.com/yhirose/cpp-httplib/tree/v0.34.0
 Copyright (c) 2017 yhirose; MIT License (cpp-httplib.txt).
-QuarkPlusPlus extends the HTTP method allowlist to support WebDAV.
+QuarkPlusPlus extends the HTTP method allowlist to support WebDAV and omits
+automatic Content-Length fields on HTTP 204 responses.
 
 nlohmann/json 3.12.0
 https://github.com/nlohmann/json/tree/v3.12.0

@@ -77,8 +77,8 @@ jobs:
         run: |
           dependencies=$(ldd dist/bin/quarkpp)
           printf '%s\n' "$dependencies"
-          if grep -E 'not found|libssl|libcrypto' <<< "$dependencies"; then
-            echo 'OpenSSL must be linked statically and all system dependencies must resolve.'
+          if grep -E 'not found|libssl|libcrypto|libcares|libpace' <<< "$dependencies"; then
+            echo 'PACE, OpenSSL and c-ares must be linked statically and all system dependencies must resolve.'
             exit 1
           fi
       - name: Check macOS runtime dependencies
@@ -87,7 +87,7 @@ jobs:
         run: |
           dependencies=$(otool -L dist/bin/quarkpp)
           printf '%s\n' "$dependencies"
-          if grep -E '/opt/homebrew|/usr/local|libssl|libcrypto' <<< "$dependencies"; then
+          if grep -E '/opt/homebrew|/usr/local|libssl|libcrypto|libcares|libpace' <<< "$dependencies"; then
             echo 'The release must not depend on a build-machine package installation.'
             exit 1
           fi

@@ -1,5 +1,7 @@
+#include "tls_trust.hpp"
 #include <httplib.h>
 #include <openssl/evp.h>
+#include <pace/http.hpp>
 #include <quarkpp/support.hpp>
 
 #include <algorithm>
@@ -13,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <thread>
 
 namespace quarkpp
 {
@@ -213,6 +216,118 @@ std::optional<ContentRange> parse_content_range(std::string_view value)
     return ContentRange{*start, *end, *total, false};
 }
 
+// A bounded wave keeps at most one MiB per worker in memory. Only consecutive,
+// fully validated ranges are committed, so the destination always remains a
+// resumable prefix even when a worker fails or the process is interrupted.
+std::optional<HttpResponse> download_parallel(const HttpClient &client, const std::string &url,
+                                              const HeaderList &headers, const std::filesystem::path &path,
+                                              std::uint64_t base, std::uint64_t total, unsigned threads,
+                                              const ProgressCallback &progress)
+{
+    constexpr std::uint64_t chunk_size = 1024 * 1024;
+    struct Segment
+    {
+        std::uint64_t start{}, length{};
+        HttpResponse response;
+        std::string bytes;
+        std::exception_ptr error;
+        bool unsupported{};
+    };
+    std::uint64_t committed = base;
+    std::ofstream output;
+    HttpResponse result;
+    while (committed < total)
+    {
+        const auto count =
+            static_cast<unsigned>(std::min<std::uint64_t>(threads, (total - committed - 1) / chunk_size + 1));
+        std::vector<Segment> segments(count);
+        {
+            std::vector<std::jthread> workers;
+            for (unsigned i = 0; i < count; ++i)
+            {
+                auto &segment = segments[i];
+                segment.start = committed + i * chunk_size;
+                segment.length = std::min(chunk_size, total - segment.start);
+                workers.emplace_back(
+                    [&, i]
+                    {
+                        auto &part = segments[i];
+                        try
+                        {
+                            auto request_headers = headers;
+                            std::erase_if(request_headers, [](const auto &h) { return to_lower(h.first) == "range"; });
+                            request_headers.emplace_back("Range", "bytes=" + std::to_string(part.start) + "-" +
+                                                                      std::to_string(part.start + part.length - 1));
+                            part.bytes.reserve(static_cast<std::size_t>(part.length));
+                            part.response = client.request_stream(
+                                url, request_headers,
+                                [&](const HttpResponse &response)
+                                {
+                                    if (response.status_code == 200)
+                                    {
+                                        part.unsupported = true;
+                                        return false;
+                                    }
+                                    const auto range = parse_content_range(response.header("content-range"));
+                                    if (response.status_code != 206 || !range || range->unsatisfied ||
+                                        range->start != part.start || range->end != part.start + part.length - 1 ||
+                                        range->total != total)
+                                        throw QuarkException(
+                                            "Parallel download Content-Range does not match the requested range");
+                                    const auto encoding = to_lower(response.header("content-encoding"));
+                                    if (!encoding.empty() && encoding != "identity")
+                                        throw QuarkException("Download server ignored Accept-Encoding: identity");
+                                    const auto length = response.header("content-length");
+                                    if (!length.empty() && parse_unsigned(length) != part.length)
+                                        throw QuarkException(
+                                            "Parallel download Content-Length does not match the requested range");
+                                    return true;
+                                },
+                                [&](const char *data, std::size_t size)
+                                {
+                                    if (size > part.length - part.bytes.size())
+                                        throw QuarkException("Parallel download exceeds the validated range");
+                                    part.bytes.append(data, size);
+                                    return true;
+                                });
+                            if (part.bytes.size() != part.length)
+                                throw QuarkException("Parallel download ended before the validated range was complete");
+                        }
+                        catch (...)
+                        {
+                            part.error = std::current_exception();
+                        }
+                    });
+            }
+        } // join every worker before inspecting its buffers or propagating errors
+        if (committed == base &&
+            std::any_of(segments.begin(), segments.end(), [](const auto &s) { return s.unsupported; }))
+            return std::nullopt; // fall back without changing an existing destination
+        for (const auto &segment : segments)
+        {
+            if (segment.error)
+                std::rethrow_exception(segment.error);
+            if (!output.is_open())
+            {
+                if (!path.parent_path().empty())
+                    std::filesystem::create_directories(path.parent_path());
+                output.open(path, std::ios::binary | (base > 0 ? std::ios::app : std::ios::trunc));
+                if (!output)
+                    throw QuarkException("Cannot open download destination: " + path_to_utf8(path));
+            }
+            output.write(segment.bytes.data(), static_cast<std::streamsize>(segment.bytes.size()));
+            output.flush();
+            if (!output)
+                throw QuarkException("Failed writing download destination (check available disk space)");
+            committed += segment.length;
+            result = segment.response;
+            if (progress)
+                progress(committed, total);
+        }
+    }
+    return result;
+}
+
 std::string base64_from_bytes(const unsigned char *data, std::size_t size)
 {
     if (size > static_cast<std::size_t>(std::numeric_limits<int>::max() / 4 * 3))
@@ -274,33 +389,52 @@ HttpResponse HttpClient::request(std::string method, const std::string &url, con
     for (unsigned attempt = 0; attempt <= max_redirects; ++attempt)
     {
         const auto parsed = parse_url(current);
-        auto client = make_client(parsed, timeout_ms_, ca_bundle_);
         HttpResponse response;
-        std::string error;
-        httplib::Request req;
+        pace::http::request req;
         req.method = method;
-        req.path = parsed.target;
-        req.headers = make_headers(active_headers);
+        for (const auto &[key, value] : make_headers(active_headers))
+            if (to_lower(key) != "host")
+                req.headers.push_back({key, value});
         req.body = body;
-        req.response_handler = [&](const httplib::Response &res)
+        try
         {
-            capture_response(res, current, response);
-            return true;
-        };
-        req.content_receiver = [&](const char *data, std::size_t size, std::uint64_t, std::uint64_t)
-        {
-            if (size > max_api_body - response.body.size())
+            const pace::blocking_options wait{.timeout = std::chrono::milliseconds(timeout_ms_)};
+            const pace::http::limits bounds{.max_body_bytes = max_api_body};
+            pace::http::response received;
+            if (!parsed.tls)
+                received = pace::http::fetch(current, std::move(req), wait, bounds);
+            else if (ca_bundle_.empty())
+                received = pace::http::fetch(default_api_trust(), current, std::move(req), wait, bounds);
+            else
             {
-                error = "HTTP API response exceeds the 16 MiB limit";
-                return false;
+                pace::tls::context trust(pace::tls::role::client, pace::tls::trust_source::application);
+                trust.load_verify_file(ca_bundle_);
+                received = pace::http::fetch(trust, current, std::move(req), wait, bounds);
             }
-            response.body.append(data, size);
-            return true;
-        };
-        const auto result = client->send(req);
-        check_result(result, error);
-        // cpp-httplib omits response_handler for HEAD and bodyless statuses.
-        capture_response(*result, current, response);
+            response.status_code = static_cast<int>(received.status);
+            response.body = std::move(received.body);
+            response.url = current;
+            for (const auto &[key, value] : received.headers)
+            {
+                response.headers[to_lower(key)] = value;
+                if (to_lower(key) == "set-cookie")
+                    response.set_cookies.push_back(value);
+            }
+        }
+        catch (const pace::http::protocol_error &error)
+        {
+            throw QuarkException("PACE HTTP protocol error: " + std::string(error.what()));
+        }
+        catch (const std::system_error &error)
+        {
+            // The error code is safe; what() may include an account or signed URL.
+            throw QuarkException("PACE HTTP transport failed: " + error.code().message());
+        }
+        catch (const std::exception &)
+        {
+            // Upstream errors may contain a signed URL or request credentials.
+            throw QuarkException("PACE HTTP request failed (transport, timeout, TLS or response limit)");
+        }
         if (!follow_redirects || !redirect_status(response.status_code))
             return response;
         const auto next = redirect_url(current, response.header("location"));
@@ -468,15 +602,21 @@ HttpResponse HttpClient::upload_file_range(const std::string &url, const QueryLi
 
 HttpResponse HttpClient::download_file(const std::string &url, const HeaderList &headers,
                                        const std::filesystem::path &output_path, bool resume,
-                                       const ProgressCallback &progress,
-                                       std::optional<std::uint64_t> expected_size) const
+                                       const ProgressCallback &progress, std::optional<std::uint64_t> expected_size,
+                                       unsigned threads) const
 {
+    if (threads == 0 || threads > 32)
+        throw QuarkException("Download threads must be between 1 and 32");
     const bool exists = std::filesystem::exists(output_path);
     if (exists && !std::filesystem::is_regular_file(output_path))
         throw QuarkException("Download destination must be a regular file");
     const std::uint64_t base = resume && exists ? std::filesystem::file_size(output_path) : 0;
     if (expected_size && base > *expected_size)
         throw QuarkException("Local partial file is larger than the expected download size");
+    if (threads > 1 && expected_size && *expected_size - base > 1024 * 1024)
+        if (const auto response =
+                download_parallel(*this, url, headers, output_path, base, *expected_size, threads, progress))
+            return *response;
     auto active_headers = headers;
     std::erase_if(active_headers, [](const auto &h) { return to_lower(h.first) == "range"; });
     if (base > 0)
