@@ -1,5 +1,17 @@
 # Testing and verification
 
+## 0.3.0 regression scope
+
+Local verification on 2026-10-28: Windows x64 release CLI and static library built with xmake 3.1.1 and MSVC 14.51. All five offline suites passed, including the new parallel-range, batch-download and generated-certificate HTTPS regressions. Staged installation, CLI version/help and Windows archive packaging passed. Cross-platform release results are recorded by the tagged GitHub Actions run.
+
+The PACE 0.4.0 migration exercises buffered API requests alongside the existing streaming, redirect, cookie-refresh and authentication fixtures. Download regressions cover bounded parallel ranges, safe contiguous-prefix resume, concurrent small-file batches, batched link issuance, duplicate-target rejection and serialized aggregate progress. The same five offline suites are run by the four-platform release matrix. Run results must be read from the corresponding local output or remote workflow; this scope does not claim a new real-account speed measurement.
+
+The real-account measurements below predate 0.3.0 and remain historical evidence for the earlier implementation.
+
+### Native HTTPS trust — 2026-10-28
+
+The Windows x64 0.3.0 CLI reached Quark's account endpoint over HTTPS using native Windows trusted certificates and an invalid test cookie. Quark returned HTTP 401 with `require login [guest]`, confirming certificate verification and the PACE request path reached the provider. This probe read no saved account configuration and does not verify authenticated account access or transfer speed. Offline TLS fixtures separately exercise explicit trusted CAs and rejection of self-signed or missing-CA configurations.
+
 ## Verification record — 2026-10-20
 
 - Terminal QR login: the user scanned the locally generated QR code and confirmed in the Quark app. The CLI exchanged the ticket, obtained drive credentials, and saved a private local config. New CLI processes successfully queried the account and listed the root using only that saved QR session. No manually copied Cookie was used for this check. Regression tests cover the account endpoint's actual string `code:"OK"`, legacy numeric zero, and rejection of invalid status types. Sanitized evidence is retained locally in `build/live-verification/qr-login.json`.

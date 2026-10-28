@@ -6,5 +6,9 @@
   "request_timeout_ms": 120000,
   "upload_retry_count": 3,
   "download_retry_count": 3,
+  "download_threads": 4,
+  "download_jobs": 4,
+  "download_batch_size": 20,
+  "small_file_threshold": 8388608,
   "task_poll_limit": 30
 }

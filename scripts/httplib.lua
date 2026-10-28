@@ -20,6 +20,15 @@ function configure(target)
     assert(first and not source:find(old, last + 1, true), "Unexpected cpp-httplib method allowlist")
     local replacement = '"CONNECT", "OPTIONS", "TRACE", "PATCH", "PRI", "PROPFIND", "MKCOL", "MOVE"};'
     local patched = source:sub(1, first - 1) .. replacement .. source:sub(last + 1)
+    -- RFC 9110 forbids Content-Length on 204 responses, including zero. PACE's
+    -- strict parser rejects it; keep our WebDAV server and loopback fixtures valid.
+    local framing = 'if (res.body.empty() && !res.content_length_ && !res.content_provider_ &&'
+    local framing_first, framing_last = patched:find(framing, 1, true)
+    assert(framing_first and not patched:find(framing, framing_last + 1, true),
+        "Unexpected cpp-httplib empty-response framing")
+    patched = patched:sub(1, framing_first - 1) ..
+        'if (res.status != 204 && res.body.empty() && !res.content_length_ && !res.content_provider_ &&' ..
+        patched:sub(framing_last + 1)
     local directory = include_directory(target)
     local output = path.join(directory, "httplib.h")
     os.mkdir(directory)

@@ -45,8 +45,8 @@ struct HashDigests
     std::string sha1_hex;
 };
 
-// Each operation owns its connection. Timeouts apply to connect and individual
-// socket reads/writes, never to the overall duration of a large transfer.
+// Each operation owns its connection. API calls use a complete-request deadline;
+// streamed file transfers use connect and individual socket read/write timeouts.
 class HttpClient
 {
   public:
@@ -68,7 +68,8 @@ class HttpClient
     [[nodiscard]] HttpResponse download_file(const std::string &url, const HeaderList &headers,
                                              const std::filesystem::path &output_path, bool resume,
                                              const ProgressCallback &progress = {},
-                                             std::optional<std::uint64_t> expected_size = std::nullopt) const;
+                                             std::optional<std::uint64_t> expected_size = std::nullopt,
+                                             unsigned threads = 1) const;
 
   private:
     unsigned timeout_ms_;

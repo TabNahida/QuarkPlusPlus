@@ -21,6 +21,10 @@ struct AppConfig
     std::string ca_bundle;
     int upload_retry_count{3};
     int download_retry_count{3};
+    unsigned download_threads{4};
+    unsigned download_jobs{4};
+    unsigned download_batch_size{20};
+    std::uint64_t small_file_threshold{8 * 1024 * 1024};
     unsigned task_poll_limit{30};
     std::string api_base{"https://drive.quark.cn/1/clouddrive"};
     std::string offline_api_base{"https://drive.quark.cn/1/clouddrive"};
@@ -82,6 +86,10 @@ class QuarkClient
     // Downloads a file or a complete directory below output_root, preserving names.
     void download(const std::string &fid, const std::filesystem::path &output_root, bool resume = true,
                   const ProgressCallback &progress = {}) const;
+    // Download selected files/directories together. Small files share bounded
+    // workers and batched link requests; progress covers the complete selection.
+    void download_batch(const std::vector<std::string> &fids, const std::filesystem::path &output_root,
+                        bool resume = true, const ProgressCallback &progress = {}) const;
     // Downloads one file to an exact local path; used by adapters such as WebDAV.
     void download_to_file(const std::string &fid, const std::filesystem::path &destination, bool resume = true,
                           const ProgressCallback &progress = {}) const;
@@ -130,7 +138,7 @@ class QuarkClient
                                             std::vector<DownloadTarget> &output,
                                             std::unordered_set<std::string> &visited, unsigned depth) const;
     void download_entry(const RemoteEntry &entry, const std::filesystem::path &destination, bool resume,
-                        const ProgressCallback &progress) const;
+                        const ProgressCallback &progress, const std::string &initial_url = {}) const;
 
     AppConfig config_;
     HttpClient http_;

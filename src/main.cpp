@@ -87,6 +87,15 @@ unsigned number(const std::string &text, const std::string &label, unsigned mini
     return result;
 }
 
+std::uint64_t byte_count(const std::string &text)
+{
+    std::uint64_t result{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), result);
+    if (error != std::errc() || end != text.data() + text.size())
+        throw QuarkException("Invalid small-file threshold");
+    return result;
+}
+
 void help()
 {
     std::cout << R"(QuarkPlusPlus — a C++20 Quark Drive client
@@ -104,6 +113,8 @@ Usage: quarkpp [--config FILE] [--json] COMMAND [OPTIONS]
   rm --fid ID | --path /PATH         Move an entry to the drive's recycle bin
   upload FILE [--to-fid ID | --to-path /PATH] [--name NAME] [--progress]
   download --fid ID | --path /PATH [--out DIRECTORY] [--no-resume] [--progress]
+           [--threads N] [--jobs N] [--batch-size N] [--small-file-threshold BYTES]
+                                    Repeat --fid/--path to download a batch
   offline parse SOURCE              Preview a magnet or HTTP(S) source
   offline add SOURCE [--to-fid ID | --to-path /PATH] [--select 0,1]
   offline list [--page N] [--size N]
@@ -118,7 +129,7 @@ QUARKPP_CONFIG overrides its path; QUARKPP_COOKIE overrides its cookie.
 Use QUARKPP_WEBDAV_PASSWORD for the local WebDAV password (required).
 The WebDAV bridge supports rclone mount on Windows, Linux, and macOS.
 Uploads through WebDAV spool to temporary disk before uploading to Quark.
---progress reports current-file transferred/total bytes to stderr once per second.
+--progress reports transferred/total bytes to stderr once per second (batch total for downloads).
 )";
 }
 
@@ -147,6 +158,14 @@ AppConfig load_config(const std::optional<std::string> &explicit_path)
         config.request_timeout_ms = data.value("request_timeout_ms", 120000U);
         config.upload_retry_count = data.value("upload_retry_count", 3);
         config.download_retry_count = data.value("download_retry_count", 3);
+        if (data.contains("download_threads"))
+            config.download_threads = number(data.at("download_threads").dump(), "download threads", 1, 32);
+        if (data.contains("download_jobs"))
+            config.download_jobs = number(data.at("download_jobs").dump(), "download jobs", 1, 32);
+        if (data.contains("download_batch_size"))
+            config.download_batch_size = number(data.at("download_batch_size").dump(), "download batch size", 1, 100);
+        if (data.contains("small_file_threshold"))
+            config.small_file_threshold = byte_count(data.at("small_file_threshold").dump());
         config.task_poll_limit = data.value("task_poll_limit", 30U);
         config.ca_bundle = data.value("ca_bundle", "");
         config.api_base = data.value("api_base", config.api_base);
@@ -264,7 +283,7 @@ int run(Arguments args)
     if (flag(args, "--version"))
     {
         exhausted(args);
-        std::cout << "QuarkPlusPlus 0.2.0\n";
+        std::cout << "QuarkPlusPlus 0.3.0\n";
         return 0;
     }
     const auto command = positional(args, "command");
@@ -280,7 +299,19 @@ int run(Arguments args)
             path_from_utf8(config_path.value_or(environment("QUARKPP_CONFIG").value_or("config/quarkpp.local.json")));
         return cli::run_login(destination, options);
     }
-    QuarkClient client(load_config(config_path));
+    auto config = load_config(config_path);
+    if (command == "download")
+    {
+        if (const auto value = option(args, "--threads"))
+            config.download_threads = number(*value, "download threads", 1, 32);
+        if (const auto value = option(args, "--jobs"))
+            config.download_jobs = number(*value, "download jobs", 1, 32);
+        if (const auto value = option(args, "--batch-size"))
+            config.download_batch_size = number(*value, "download batch size", 1, 100);
+        if (const auto value = option(args, "--small-file-threshold"))
+            config.small_file_threshold = byte_count(*value);
+    }
+    QuarkClient client(std::move(config));
     if (command == "account")
     {
         exhausted(args);
@@ -323,13 +354,25 @@ int run(Arguments args)
     }
     else if (command == "download")
     {
-        const auto id = fid(client, args);
+        std::vector<std::string> ids;
+        for (;;)
+        {
+            const auto selector = std::find_if(args.begin(), args.end(),
+                                               [](const auto &arg) { return arg == "--fid" || arg == "--path"; });
+            if (selector == args.end())
+                break;
+            const auto name = *selector;
+            const auto value = *option(args, name);
+            ids.push_back(name == "--fid" ? value : client.resolve_path(value).fid);
+        }
+        if (ids.empty())
+            throw QuarkException("Specify --fid or --path");
         const auto output = option(args, "--out");
         const auto resume = !flag(args, "--no-resume");
         TransferProgress progress(flag(args, "--progress"), "download");
         exhausted(args);
         const auto destination = output ? path_from_utf8(*output) : client.config().download_dir;
-        client.download(id, destination, resume, progress.callback());
+        client.download_batch(ids, destination, resume, progress.callback());
         progress.finish();
         print({{"status", "ok"}, {"output", path_to_utf8(destination)}});
     }

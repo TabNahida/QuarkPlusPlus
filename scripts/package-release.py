@@ -56,13 +56,18 @@ def package(platform: str, arch: str) -> None:
         raise ValueError("SOURCE_COMMIT must be a full Git commit identifier")
     epoch = int(subprocess.check_output(["git", "show", "-s", "--format=%ct", commit], cwd=ROOT, text=True))
     installed = ROOT / "dist"
+    executable = "bin/quarkpp.exe" if platform == "windows" else "bin/quarkpp"
+    installed_version = subprocess.check_output(
+        [str(installed / executable), "--version"], text=True
+    ).strip()
+    if installed_version != f"QuarkPlusPlus {version}":
+        raise ValueError(f"Installed CLI version does not match project version {version}: {installed_version}")
     example = json.loads((installed / "share/quarkpp/config/quarkpp.example.json").read_text(encoding="utf-8-sig"))
     if example.get("cookie"):
         raise ValueError("The distributed example configuration must not contain a cookie")
     OUTPUT.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="package-", dir=ROOT / "build") as temporary:
         stage = Path(temporary) / prefix
-        executable = "bin/quarkpp.exe" if platform == "windows" else "bin/quarkpp"
         library = "lib/quarkpp.lib" if platform == "windows" else "lib/libquarkpp.a"
         files = [installed / executable, installed / library]
         files += sorted((installed / "include/quarkpp").glob("*.hpp"))
@@ -83,9 +88,9 @@ def package(platform: str, arch: str) -> None:
             "project": "QuarkPlusPlus", "version": version, "commit": commit,
             "platform": platform, "architecture": arch,
             "source": f"https://github.com/TabNahida/QuarkPlusPlus/tree/{commit}",
-            "dependencies": {"cpp-httplib": "0.34.0", "OpenSSL": "3.6.1", "nlohmann/json": "3.12.0"},
-            "library_usage": "C++20; link the static library with OpenSSL and system threading/socket libraries; provide nlohmann/json headers. Match the build compiler ABI and runtime (Windows: MSVC /MT).",
-            "runtime": "Windows x64 / macOS 15+ / Linux glibc 2.39+ with GCC 13 libstdc++ as indicated by the platform. OpenSSL is linked statically into the CLI.",
+            "dependencies": {"PACE": "0.4.0", "cpp-httplib": "0.34.0", "OpenSSL": "3.6.1", "c-ares": "1.34.8", "nlohmann/json": "3.12.0"},
+            "library_usage": "C++20; link quarkpp with PACE 0.4.0 (HTTP/1, TLS and DNS enabled), OpenSSL, c-ares and system threading/socket libraries; provide nlohmann/json headers. Third-party SDK dependencies are external to this archive. Match the build compiler ABI and runtime (Windows: MSVC /MT).",
+            "runtime": "Windows x64 / macOS 15+ / Linux glibc 2.39+ with GCC 13 libstdc++ as indicated by the platform. PACE, OpenSSL and c-ares are linked statically into the CLI.",
         }
         (stage / "BUILD-INFO.json").write_text(json.dumps(build_info, indent=2) + "\n", encoding="utf-8")
         archive = OUTPUT / (prefix + (".zip" if platform == "windows" else ".tar.gz"))

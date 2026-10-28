@@ -1,10 +1,13 @@
 #include "quarkpp/client.hpp"
+#include "thread_group.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <chrono>
 #include <format>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -407,6 +410,9 @@ QuarkClient::QuarkClient(AppConfig config)
     }
     config_.upload_retry_count = clamp_retry_count(config_.upload_retry_count);
     config_.download_retry_count = clamp_retry_count(config_.download_retry_count);
+    if (config_.download_threads == 0 || config_.download_threads > 32 || config_.download_jobs == 0 ||
+        config_.download_jobs > 32 || config_.download_batch_size == 0 || config_.download_batch_size > 100)
+        throw QuarkException("Download threads/jobs must be between 1 and 32; batch size must be between 1 and 100");
     if (config_.task_poll_limit == 0)
         throw QuarkException("task_poll_limit must be positive");
     while (config_.api_base.ends_with('/'))
@@ -1073,7 +1079,7 @@ std::vector<DownloadTarget> QuarkClient::collect_download_targets(const std::str
 }
 
 void QuarkClient::download_entry(const RemoteEntry &entry, const std::filesystem::path &destination, bool resume,
-                                 const ProgressCallback &progress) const
+                                 const ProgressCallback &progress, const std::string &initial_url) const
 {
     if (entry.dir)
         throw QuarkException("download_to_file expects a file");
@@ -1118,9 +1124,12 @@ void QuarkClient::download_entry(const RemoteEntry &entry, const std::filesystem
         {
             // Signed URLs expire. Every retry asks the API for a fresh one and
             // resumes the bytes already written by the streaming transport.
-            const auto url = download_url(entry.fid);
+            const auto url = attempt == 0 && !initial_url.empty() ? initial_url : download_url(entry.fid);
+            validate_download_origin(url, config_.api_base);
             const auto headers = download_headers();
-            const auto response = http_.download_file(url, headers, destination, can_resume, report, entry.size);
+            const auto threads = entry.size > config_.small_file_threshold ? config_.download_threads : 1;
+            const auto response =
+                http_.download_file(url, headers, destination, can_resume, report, entry.size, threads);
             if ((response.status_code < 200 || response.status_code >= 300) && response.status_code != 416)
                 throw QuarkException("Download failed, HTTP " + std::to_string(response.status_code));
             if (!std::filesystem::exists(destination) || std::filesystem::file_size(destination) != entry.size)
@@ -1151,31 +1160,198 @@ void QuarkClient::download_to_file(const std::string &fid, const std::filesystem
 void QuarkClient::download(const std::string &fid, const std::filesystem::path &output_root, bool resume,
                            const ProgressCallback &progress) const
 {
+    download_batch({fid}, output_root, resume, progress);
+}
+
+void QuarkClient::download_batch(const std::vector<std::string> &fids, const std::filesystem::path &output_root,
+                                 bool resume, const ProgressCallback &progress) const
+{
     // The caller may deliberately select a directory alias. Only this trusted
     // root is resolved; every remote-derived component below it is checked.
     const auto root = std::filesystem::weakly_canonical(std::filesystem::absolute(output_root));
-    const auto targets = collect_download_targets(fid);
+    std::vector<DownloadTarget> targets;
+    std::unordered_set<std::string> roots;
+    for (const auto &fid : fids)
+    {
+        if (!roots.insert(fid).second)
+            continue;
+        auto selection = collect_download_targets(fid);
+        targets.insert(targets.end(), std::make_move_iterator(selection.begin()),
+                       std::make_move_iterator(selection.end()));
+    }
     // Validate all materialized paths before writing any file.
     std::unordered_set<std::string> names;
+    std::unordered_set<std::string> file_names;
     for (const auto &target : targets)
     {
         auto name = path_to_utf8(target.relative_path);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         name = to_lower(name);
 #endif
         if (!names.insert(name).second)
             throw QuarkException("Remote names collide on the local filesystem");
-        reject_symlink_path(root / target.relative_path);
+        if (!target.dir)
+            file_names.insert(name);
+        const auto destination = root / target.relative_path;
+        reject_symlink_path(destination);
+        if (std::filesystem::exists(destination) &&
+            (target.dir ? !std::filesystem::is_directory(destination) : !std::filesystem::is_regular_file(destination)))
+            throw QuarkException("Download destination has an incompatible file type");
+        // A selected file must never also be an ancestor of another selection.
+        auto parent = target.relative_path.parent_path();
+        while (!parent.empty())
+        {
+            const auto ancestor = root / parent;
+            if (std::filesystem::exists(ancestor) && !std::filesystem::is_directory(ancestor))
+                throw QuarkException("Download parent is not a directory");
+            parent = parent.parent_path();
+        }
     }
     for (const auto &target : targets)
     {
+        auto parent = target.relative_path.parent_path();
+        while (!parent.empty())
+        {
+            auto ancestor = path_to_utf8(parent);
+#if defined(_WIN32) || defined(__APPLE__)
+            ancestor = to_lower(ancestor);
+#endif
+            if (file_names.contains(ancestor))
+                throw QuarkException("A selected file overlaps a download directory");
+            parent = parent.parent_path();
+        }
+    }
+
+    std::uint64_t total = 0;
+    for (const auto &target : targets)
+        if (!target.dir)
+        {
+            if (target.size > std::numeric_limits<std::uint64_t>::max() - total)
+                throw QuarkException("Combined download size exceeds the supported range");
+            total += target.size;
+            const auto destination = root / target.relative_path;
+            if (resume && std::filesystem::exists(destination) && std::filesystem::file_size(destination) > target.size)
+                throw QuarkException("Local file is larger than remote file; restart without resume");
+        }
+
+    std::vector<std::uint64_t> completed(targets.size(), 0);
+    std::uint64_t current = 0;
+    std::mutex progress_mutex;
+    std::exception_ptr progress_error;
+    const auto report = [&](std::size_t index, std::uint64_t bytes)
+    {
+        std::lock_guard lock(progress_mutex);
+        if (progress_error)
+            std::rethrow_exception(progress_error);
+        const auto next = std::max(completed[index], std::min(bytes, targets[index].size));
+        current += next - completed[index];
+        completed[index] = next;
+        if (progress)
+            try
+            {
+                progress(current, total);
+            }
+            catch (...)
+            {
+                progress_error = std::current_exception();
+                throw;
+            }
+    };
+    if (progress)
+        progress(0, total);
+    std::vector<std::size_t> small, large;
+    for (std::size_t i = 0; i < targets.size(); ++i)
+    {
+        const auto &target = targets[i];
         const auto destination = root / target.relative_path;
         if (target.dir)
             std::filesystem::create_directories(destination);
         else
-            download_entry(RemoteEntry{target.fid, "", "", target.size, false, json::object()}, destination, resume,
-                           progress);
+        {
+            if (resume && std::filesystem::exists(destination))
+            {
+                report(i, std::filesystem::file_size(destination));
+                if (completed[i] == target.size)
+                    continue;
+            }
+            (target.size <= config_.small_file_threshold ? small : large).push_back(i);
+        }
     }
+
+    const auto transfer = [&](std::size_t index, const std::string &url)
+    {
+        const auto &target = targets[index];
+        download_entry(
+            RemoteEntry{target.fid, "", "", target.size, false, json::object()}, root / target.relative_path, resume,
+            [&](std::uint64_t bytes, std::uint64_t) { report(index, bytes); }, url);
+        report(index, target.size);
+    };
+    const auto run_group = [&](const std::vector<std::size_t> &indices, unsigned jobs)
+    {
+        for (std::size_t begin = 0; begin < indices.size(); begin += config_.download_batch_size)
+        {
+            const auto count = std::min<std::size_t>(config_.download_batch_size, indices.size() - begin);
+            std::vector<std::string> ids;
+            ids.reserve(count);
+            for (std::size_t n = 0; n < count; ++n)
+                ids.push_back(targets[indices[begin + n]].fid);
+            std::unordered_map<std::string, std::string> links;
+            for (int attempt = 0;; ++attempt)
+                try
+                {
+                    links = request_download_urls(ids);
+                    break;
+                }
+                catch (...)
+                {
+                    if (attempt + 1 >= config_.download_retry_count)
+                        throw;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250 * (attempt + 1)));
+                }
+            for (const auto &id : ids)
+            {
+                const auto link = links.find(id);
+                if (link == links.end() || link->second.empty())
+                    throw QuarkException("Provider returned no download URL for a selected file");
+                validate_download_origin(link->second, config_.api_base);
+            }
+
+            std::atomic<std::size_t> next{0};
+            std::atomic<bool> stopped{false};
+            std::exception_ptr error;
+            std::mutex error_mutex;
+            const auto worker = [&]
+            {
+                while (!stopped)
+                {
+                    const auto item = next.fetch_add(1);
+                    if (item >= count)
+                        return;
+                    try
+                    {
+                        transfer(indices[begin + item], links.at(ids[item]));
+                    }
+                    catch (...)
+                    {
+                        stopped = true;
+                        std::lock_guard lock(error_mutex);
+                        if (!error)
+                            error = std::current_exception();
+                    }
+                }
+            };
+            {
+                detail::ThreadGroup workers(std::min<std::size_t>(jobs, count));
+                for (std::size_t n = 0; n < std::min<std::size_t>(jobs, count); ++n)
+                    workers.emplace_back(worker);
+            }
+            if (error)
+                std::rethrow_exception(error);
+        }
+    };
+    run_group(small, config_.download_jobs);
+    // Segmented large-file transfers already have their own bounded workers.
+    run_group(large, 1);
 }
 
 json QuarkClient::offline_post(const std::string &endpoint, const json &body) const
